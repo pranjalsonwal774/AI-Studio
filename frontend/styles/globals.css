@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Rajdhani:wght@500;600;700&display=swap');
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  font-family: 'Rajdhani', -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+    Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+  background-color: #06060c;
+  color: #f3f4f6;
+  overflow-x: hidden;
+}
+
+h1, h2, h3, .font-orbitron {
+  font-family: 'Orbitron', sans-serif;
+}
+
+/* Neon mesh background */
+.mesh-bg {
+  background-image: 
+    radial-gradient(at 10% 20%, rgba(188, 52, 250, 0.15) 0px, transparent 50%),
+    radial-gradient(at 90% 10%, rgba(0, 240, 255, 0.15) 0px, transparent 50%),
+    radial-gradient(at 50% 80%, rgba(255, 0, 127, 0.1) 0px, transparent 50%);
+  background-size: 100% 100%;
+}
+
+/* Glassmorphism utility */
+.glass-panel {
+  background: rgba(11, 11, 22, 0.45);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.glass-panel-glow {
+  background: rgba(16, 16, 35, 0.6);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(0, 240, 255, 0.2);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3), 0 0 15px rgba(0, 240, 255, 0.1);
+}
+
+/* Cyberpunk grid overlay */
+.grid-overlay {
+  background-size: 40px 40px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+}
+
+/* Custom neon scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #06060c;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(188, 52, 250, 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 240, 255, 0.6);
+}
+
+/* Range input comparison slider customizations */
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 4px;
+  height: 40px;
+  background: #00f0ff;
+  box-shadow: 0 0 10px #00f0ff, 0 0 20px #bc34fa;
+  cursor: ew-resize;
+  border-radius: 2px;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 4px;
+  height: 40px;
+  background: #00f0ff;
+  box-shadow: 0 0 10px #00f0ff, 0 0 20px #bc34fa;
+  cursor: ew-resize;
+  border-radius: 2px;
+}

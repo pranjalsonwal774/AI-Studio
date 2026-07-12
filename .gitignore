@@ -1,0 +1,25 @@
+# Virtual environment
+venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+.agents/
+
+# NextJS / Frontend node modules & build
+node_modules/
+.next/
+out/
+build/
+.next-env.d.ts
+
+# Backend dynamic databases, logs, and storage cache
+backend/data/
+backend/models_cache/
+backend/logs/
+*.db
+*.log
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
