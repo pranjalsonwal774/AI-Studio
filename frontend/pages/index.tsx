@@ -4,18 +4,13 @@ import { useApi } from '../hooks/useApi';
 import { CameraFeed } from '../components/CameraFeed';
 import { DesignPanel } from '../components/DesignPanel';
 import { ImageCompare } from '../components/ImageCompare';
-import { LoadingOverlay } from '../components/LoadingOverlay';
-import { GlassCard } from '../components/GlassCard';
 import {
-  Printer, Download, QrCode, RotateCcw, Share2, Sparkles,
+  Printer, Download, QrCode, RotateCcw, Sparkles,
   CheckCircle, AlertCircle, X as XIcon, Camera,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Toast types
-// ─────────────────────────────────────────────────────────────────────────────
 interface Toast {
   id: number;
   type: 'success' | 'error' | 'info';
@@ -37,23 +32,20 @@ export default function Home() {
     uploadManualCapture,
   } = useApi();
 
-  // API Lists
+  // Preset Configurations
   const [styles, setStyles]           = useState<any[]>([]);
   const [backgrounds, setBackgrounds] = useState<any[]>([]);
-
-  // Style selection (keeps running regardless of stage)
   const [activeStyle, setActiveStyle]           = useState<string>('Anime');
   const [activeBackground, setActiveBackground] = useState<string>('Cherry Blossoms');
 
-  // Main lifecycle stage
-  // mirror: live Ghibli feed always visible
-  // result: user chose to view full result (from toast CTA)
+  // Ghibli Avatar Generation spooler states
+  const [avatarUrl, setAvatarUrl]                   = useState<string | null>(null);
+  const [generationProgress, setGenerationProgress] = useState<number>(0);
+  const [generationStatus, setGenerationStatus]     = useState<string>('');
+
+  // Main UI phase
   const [stage, setStage] = useState<'mirror' | 'result'>('mirror');
-
-  // Full-screen result photo (only entered via toast "View Result" CTA)
   const [activePhoto, setActivePhoto] = useState<any>(null);
-
-  // Toasts for background auto-captures
   const [toasts, setToasts] = useState<Toast[]>([]);
 
   // Action status indicators
@@ -61,86 +53,92 @@ export default function Home() {
   const [upscaling, setUpscaling] = useState(false);
   const [showQr,    setShowQr]    = useState(false);
 
-  // ── Fetch presets ──────────────────────────────────────────────────────────
+  // Fetch styles and backgrounds
   useEffect(() => {
-    fetchStyles()
-      .then((data: any[]) => {
-        setStyles(data);
-        if (data.length > 0) setActiveStyle(data[0].id);
-      })
-      .catch(() => {
-        // API not ready yet — use defaults silently
-      });
-    fetchBackgrounds()
-      .then((data: any[]) => {
-        setBackgrounds(data);
-        if (data.length > 0) setActiveBackground(data[0].id);
-      })
-      .catch(() => {});
+    fetchStyles().then(data => {
+      setStyles(data);
+      if (data.length > 0) setActiveStyle(data[0].id);
+    }).catch(() => {});
+
+    fetchBackgrounds().then(data => {
+      setBackgrounds(data);
+      if (data.length > 0) setActiveBackground(data[0].id);
+    }).catch(() => {});
   }, [fetchStyles, fetchBackgrounds]);
 
-  // ── Toast helpers ──────────────────────────────────────────────────────────
+  // Toast utilities
   const addToast = useCallback((t: Omit<Toast, 'id'>) => {
     const id = ++toastCounter;
     setToasts(prev => [...prev, { ...t, id }]);
-    setTimeout(() => removeToast(id), 8000);
+    setTimeout(() => removeToast(id), 6000);
   }, []);
 
   const removeToast = useCallback((id: number) => {
     setToasts(prev => prev.filter(t => t.id !== id));
   }, []);
 
-  // ── Background generation task runner ─────────────────────────────────────
-  const runBackgroundGeneration = useCallback(async (photoId: string) => {
+  // ── Generation Loop ──
+  const startAvatarGeneration = useCallback(async (photoId: string) => {
+    setGenerationProgress(5);
+    setGenerationStatus('Registering portrait in booth spooler...');
+
     try {
       const task = await submitGeneration(photoId, activeStyle, activeBackground);
       const taskId = task.task_id;
 
-      const poll = () => {
-        const timer = setInterval(async () => {
-          try {
-            const info = await pollTaskStatus(taskId);
-            if (info.status === 'completed') {
-              clearInterval(timer);
-              addToast({
-                type: 'success',
-                message: 'Ghibli portrait ready!',
-                animeUrl: info.upscaled_url || info.anime_url,
-                photoId,
-              });
-              confetti({
-                particleCount: 80, spread: 60,
-                origin: { y: 0.75 },
-                colors: ['#10b981', '#34d399', '#6ee7b7'],
-              });
-            } else if (info.status === 'failed') {
-              clearInterval(timer);
-              addToast({ type: 'error', message: 'Portrait generation failed. Try again.' });
-            }
-          } catch (_) {
+      const timer = setInterval(async () => {
+        try {
+          const info = await pollTaskStatus(taskId);
+          setGenerationProgress(info.progress);
+          setGenerationStatus(info.status === 'processing' ? 'Running neural style models...' : info.status);
+
+          if (info.status === 'completed') {
             clearInterval(timer);
+            setAvatarUrl(info.anime_url);
+            addToast({
+              type: 'success',
+              message: 'Ghibli avatar is live in the mirror!',
+              animeUrl: info.upscaled_url || info.anime_url,
+              photoId
+            });
+            confetti({
+              particleCount: 70,
+              spread: 60,
+              origin: { y: 0.8 },
+              colors: ['#34d399', '#60a5fa', '#a78bfa']
+            });
+          } else if (info.status === 'failed') {
+            clearInterval(timer);
+            addToast({ type: 'error', message: 'Model generation failed.' });
+            resetMirrorState();
           }
-        }, 1000);
-      };
-      poll();
+        } catch (err) {
+          clearInterval(timer);
+          resetMirrorState();
+        }
+      }, 1000);
     } catch (err: any) {
-      addToast({ type: 'error', message: 'Could not start generation: ' + err.message });
+      addToast({ type: 'error', message: 'Spooler failed: ' + err.message });
+      resetMirrorState();
     }
   }, [submitGeneration, pollTaskStatus, activeStyle, activeBackground, addToast]);
 
-  // ── CameraFeed callback: NON-BLOCKING ──────────────────────────────────────
-  // Mirror stays live; generation runs silently in background.
+  // Callback when face is detected and capture is generated
   const handlePhotoCaptured = useCallback(async (photoId: string, originalUrl: string) => {
-    addToast({ type: 'info', message: '📸 Portrait captured — generating Ghibli art…' });
-    await runBackgroundGeneration(photoId);
-  }, [runBackgroundGeneration, addToast]);
+    await startAvatarGeneration(photoId);
+  }, [startAvatarGeneration]);
 
-  // ── Upload wrapper compatible with CameraFeed's expected signature ─────────
   const handleUploadManual = useCallback(async (file: File) => {
     return uploadManualCapture(file, activeStyle, activeBackground);
   }, [uploadManualCapture, activeStyle, activeBackground]);
 
-  // ── View full result (from toast) ─────────────────────────────────────────
+  // Reset Mirror states when user leaves the frame
+  const resetMirrorState = useCallback(() => {
+    setAvatarUrl(null);
+    setGenerationProgress(0);
+    setGenerationStatus('');
+  }, []);
+
   const viewFullResult = useCallback(async (photoId: string) => {
     try {
       const res = await fetch(`/api/v1/history`);
@@ -154,18 +152,16 @@ export default function Home() {
         }
       }
     } catch (_) {}
-    // Fallback: just set photo id
     setActivePhoto({ id: photoId });
     setStage('result');
   }, []);
 
-  // ── Actions in result view ────────────────────────────────────────────────
   const handlePrint = async () => {
     if (!activePhoto) return;
     setPrinting(true);
     try {
       await triggerPrint(activePhoto.id);
-      confetti({ particleCount: 50, spread: 40, colors: ['#00ff66', '#00f0ff'] });
+      confetti({ particleCount: 50, spread: 40, colors: ['#34d399', '#60a5fa'] });
     } catch (err: any) {
       addToast({ type: 'error', message: 'Spooler error: ' + err.message });
     } finally { setPrinting(false); }
@@ -188,17 +184,14 @@ export default function Home() {
     setShowQr(false);
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────
   return (
     <>
       <Head>
-        <title>Ghibli Mirror | Real-Time AI Photo Booth</title>
-        <meta name="description" content="Step in front of the camera and see yourself transformed into a living Studio Ghibli painting in real time." />
+        <title>Ghibli Mirror | AI Digital Portrait Studio</title>
+        <meta name="description" content="A magical hand-painted Studio Ghibli mirror reflecting your exact expressions and movements in real-time." />
       </Head>
 
-      {/* ── Toast Stack ── */}
+      {/* Toast Notification Stack */}
       <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-3 pointer-events-none">
         <AnimatePresence mode="popLayout">
           {toasts.map(t => (
@@ -208,7 +201,6 @@ export default function Home() {
               initial={{ opacity: 0, x: 60, scale: 0.9 }}
               animate={{ opacity: 1, x: 0, scale: 1 }}
               exit={{ opacity: 0, x: 60, scale: 0.9 }}
-              transition={{ type: 'spring', stiffness: 300, damping: 25 }}
               className={`pointer-events-auto flex items-start gap-3 p-3 pr-4 rounded-2xl shadow-2xl border backdrop-blur-md max-w-xs
                 ${t.type === 'success' ? 'bg-emerald-950/90 border-emerald-500/40' :
                   t.type === 'error'   ? 'bg-red-950/90 border-red-500/40' :
@@ -225,20 +217,20 @@ export default function Home() {
                   <div className="flex gap-2 mt-2">
                     <img
                       src={`http://localhost:8000${t.animeUrl}`}
-                      alt="Ghibli portrait"
-                      className="w-16 h-16 object-cover rounded-lg border border-emerald-500/30"
+                      alt="Ghibli Portrait"
+                      className="w-15 h-15 object-cover rounded-lg border border-emerald-500/30"
                     />
-                    <div className="flex flex-col gap-1.5 justify-center">
+                    <div className="flex flex-col gap-1 justify-center">
                       <button
                         onClick={() => t.photoId && viewFullResult(t.photoId)}
-                        className="text-[10px] font-orbitron text-emerald-400 underline hover:text-emerald-300"
+                        className="text-[9px] font-orbitron text-emerald-400 underline hover:text-emerald-300"
                       >
-                        VIEW FULL RESULT
+                        VIEW RESULT
                       </button>
                       <a
                         href={`http://localhost:8000${t.animeUrl}`}
                         download
-                        className="text-[10px] font-orbitron text-cyan-400 underline hover:text-cyan-300"
+                        className="text-[9px] font-orbitron text-cyan-400 underline hover:text-cyan-300"
                       >
                         DOWNLOAD
                       </a>
@@ -246,10 +238,7 @@ export default function Home() {
                   </div>
                 )}
               </div>
-              <button
-                onClick={() => removeToast(t.id)}
-                className="text-white/30 hover:text-white/70 transition-colors mt-0.5"
-              >
+              <button onClick={() => removeToast(t.id)} className="text-white/30 hover:text-white/70 transition-colors mt-0.5">
                 <XIcon className="w-3.5 h-3.5" />
               </button>
             </motion.div>
@@ -257,36 +246,37 @@ export default function Home() {
         </AnimatePresence>
       </div>
 
-      {/* ── Main layout ── */}
       <div className="flex flex-col gap-8 w-full max-w-5xl mx-auto items-center">
-
         {/* Header */}
         <div className="text-center w-full">
-          <h1 className="text-3xl md:text-5xl font-extrabold tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 via-cyan-200 to-purple-300 font-orbitron drop-shadow-[0_0_20px_rgba(52,211,153,0.2)]">
-            GHIBLI MIRROR
+          <h1 className="text-3xl md:text-5xl font-extrabold tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 via-cyan-200 to-purple-300 font-orbitron drop-shadow-[0_0_20px_rgba(52,211,153,0.25)]">
+            GHIBLI MIRROR 2.0
           </h1>
           <p className="text-xs md:text-sm text-gray-500 font-sans mt-2 tracking-wide max-w-md mx-auto leading-relaxed">
-            Step in front of the camera. See yourself as a living Studio Ghibli painting.
+            Stand still for a second to lock your identity, and look into a magical live Ghibli portrait reflecting your movements.
           </p>
         </div>
 
         <AnimatePresence mode="wait">
-
-          {/* ── STAGE: Mirror (default, always live) ── */}
+          {/* STAGE 1: Live Ghibli Mirror */}
           {stage === 'mirror' && (
             <motion.div
               key="stage-mirror"
               initial={{ opacity: 0, y: 15 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -15 }}
-              transition={{ duration: 0.35 }}
               className="flex flex-col gap-6 w-full"
             >
               <CameraFeed
                 style={activeStyle}
                 background={activeBackground}
+                avatarUrl={avatarUrl}
+                generationProgress={generationProgress}
+                generationStatus={generationStatus}
                 onCaptured={handlePhotoCaptured}
                 uploadManual={handleUploadManual}
+                onFaceDetected={() => {}}
+                onReset={resetMirrorState}
               />
 
               <DesignPanel
@@ -297,26 +287,18 @@ export default function Home() {
                 onStyleSelect={setActiveStyle}
                 onBackgroundSelect={setActiveBackground}
               />
-
-              {/* Smile-to-capture hint */}
-              <div className="flex items-center justify-center gap-2 text-[11px] text-gray-600 font-sans">
-                <span className="text-base">😊</span>
-                <span>Smile and hold still for <span className="text-emerald-500/80">3 seconds</span> to auto-capture a high-quality portrait</span>
-              </div>
             </motion.div>
           )}
 
-          {/* ── STAGE: Result (full-screen comparison) ── */}
+          {/* STAGE 2: Painting Results & Printing Options */}
           {stage === 'result' && activePhoto && (
             <motion.div
               key="stage-result"
               initial={{ opacity: 0, scale: 0.97 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0 }}
-              transition={{ duration: 0.4 }}
               className="flex flex-col md:flex-row gap-8 w-full"
             >
-              {/* Image comparison slider */}
               <div className="flex-1 max-w-2xl bg-cyber-darker/20 rounded-3xl p-1">
                 {activePhoto.anime_url || activePhoto.upscaled_url ? (
                   <ImageCompare
@@ -325,12 +307,11 @@ export default function Home() {
                   />
                 ) : (
                   <div className="aspect-video flex items-center justify-center text-gray-500 text-sm rounded-3xl bg-white/5">
-                    Processing portrait…
+                    Processing Portrait...
                   </div>
                 )}
               </div>
 
-              {/* Actions panel */}
               <div className="w-full md:w-80 flex flex-col justify-between p-8 rounded-3xl glass-panel-glow border-emerald-500/20">
                 <div>
                   <h3 className="font-orbitron font-extrabold text-base tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400 mb-1">
@@ -347,12 +328,6 @@ export default function Home() {
                       <span className="text-gray-500 font-orbitron">ENVIRONMENT</span>
                       <span className="text-gray-200 font-semibold">{activeBackground}</span>
                     </div>
-                    {activePhoto.processing_time_sec && (
-                      <div className="flex justify-between border-b border-white/5 pb-2">
-                        <span className="text-gray-500 font-orbitron">PROCESSED IN</span>
-                        <span className="text-gray-200 font-mono">{activePhoto.processing_time_sec.toFixed(2)}s</span>
-                      </div>
-                    )}
                   </div>
                 </div>
 
@@ -435,7 +410,6 @@ export default function Home() {
 
             </motion.div>
           )}
-
         </AnimatePresence>
       </div>
     </>

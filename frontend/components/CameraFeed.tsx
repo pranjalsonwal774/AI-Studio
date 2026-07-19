@@ -12,9 +12,7 @@ import {
   Wifi,
   RefreshCw,
   AlertCircle,
-  Eye,
   Video,
-  List,
   Terminal
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -28,6 +26,21 @@ interface CameraFeedProps {
   background: string;
   onCaptured: (photoId: string, originalUrl: string) => void;
   uploadManual: (file: File) => Promise<any>;
+  avatarUrl: string | null;            // Completed Ghibli portrait URL
+  generationProgress: number;          // 0-100 progress of backend model
+  generationStatus: string;            // Text status from backend spooler
+  onFaceDetected: () => void;          // Callback when face is first locked
+  onReset: () => void;                 // Callback when user leaves
+}
+
+interface Particle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  size: number;
+  alpha: number;
+  color: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,219 +85,248 @@ async function loadFaceApi(): Promise<any> {
   return fa;
 }
 
-async function loadORT(): Promise<any> {
-  if ((window as any).ort) return (window as any).ort;
-  await new Promise<void>((res, rej) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js';
-    s.async = true; s.onload = () => res(); s.onerror = rej;
-    document.head.appendChild(s);
-  });
-  return (window as any).ort;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// WebGL Style Transfer Function
-// ─────────────────────────────────────────────────────────────────────────────
-async function runAnimeGAN(
-  session: any,
-  srcCanvas: HTMLCanvasElement,
-  outCtx: CanvasRenderingContext2D,
-  outW: number,
-  outH: number,
-  ort: any
-): Promise<void> {
-  const SIZE = 512;
-  const tmp = document.createElement('canvas');
-  tmp.width = SIZE; tmp.height = SIZE;
-  const tc = tmp.getContext('2d')!;
-  tc.drawImage(srcCanvas, 0, 0, SIZE, SIZE);
-  const imgData = tc.getImageData(0, 0, SIZE, SIZE);
-  const { data } = imgData;
-
-  const float32 = new Float32Array(3 * SIZE * SIZE);
-  for (let i = 0; i < SIZE * SIZE; i++) {
-    float32[i]                  = (data[i * 4]     / 127.5) - 1.0; // R
-    float32[SIZE * SIZE + i]    = (data[i * 4 + 1] / 127.5) - 1.0; // G
-    float32[SIZE * SIZE * 2 + i] = (data[i * 4 + 2] / 127.5) - 1.0; // B
-  }
-
-  const tensor = new ort.Tensor('float32', float32, [1, 3, SIZE, SIZE]);
-  const feeds: Record<string, any> = {};
-  feeds[session.inputNames[0]] = tensor;
-  const results = await session.run(feeds);
-  const out = results[session.outputNames[0]].data as Float32Array;
-
-  const outImg = outCtx.createImageData(SIZE, SIZE);
-  const od = outImg.data;
-  for (let i = 0; i < SIZE * SIZE; i++) {
-    od[i * 4]     = Math.min(255, Math.max(0, (out[i]                   + 1.0) * 127.5));
-    od[i * 4 + 1] = Math.min(255, Math.max(0, (out[SIZE * SIZE + i]     + 1.0) * 127.5));
-    od[i * 4 + 2] = Math.min(255, Math.max(0, (out[SIZE * SIZE * 2 + i] + 1.0) * 127.5));
-    od[i * 4 + 3] = 255;
-  }
-
-  const scaleTmp = document.createElement('canvas');
-  scaleTmp.width = SIZE; scaleTmp.height = SIZE;
-  scaleTmp.getContext('2d')!.putImageData(outImg, 0, 0);
-  outCtx.drawImage(scaleTmp, 0, 0, outW, outH);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Camera Feed View Component
+// Main Component
 // ─────────────────────────────────────────────────────────────────────────────
 export const CameraFeed: React.FC<CameraFeedProps> = ({
   style,
   background,
   onCaptured,
   uploadManual,
+  avatarUrl,
+  generationProgress,
+  generationStatus,
+  onFaceDetected,
+  onReset
 }) => {
   // ── Refs ──────────────────────────────────────────────────────────────────
-  const videoRef        = useRef<HTMLVideoElement>(null);
-  const mirrorCanvasRef = useRef<HTMLCanvasElement>(null);
-  const fileInputRef    = useRef<HTMLInputElement>(null);
-  const sessionRef      = useRef<any>(null);
-  const ortRef          = useRef<any>(null);
-  const faceApiRef      = useRef<any>(null);
-  const rafRef          = useRef<number>(0);
-  const detectionTimer  = useRef<ReturnType<typeof setInterval> | null>(null);
-  const smileTimer      = useRef<number>(0);
-  const lastFrameTime   = useRef<number>(0);
+  const videoRef          = useRef<HTMLVideoElement>(null);
+  const displayCanvasRef  = useRef<HTMLCanvasElement>(null);
+  const fileInputRef      = useRef<HTMLInputElement>(null);
+  const faceApiRef        = useRef<any>(null);
+  const rafRef            = useRef<number>(0);
+  const detectionTimer    = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── Camera Manager Hook ───────────────────────────────────────────────────
-  const camera = useCameraManager(videoRef);
+  // Avatar Loading Cache Refs
+  const avatarImageRef    = useRef<HTMLImageElement | null>(null);
+  const avatarLoadedUrlRef = useRef<string | null>(null);
 
-  // ── AI Model States ───────────────────────────────────────────────────────
-  const [aiState, setAiState]       = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
-  const [aiBootMsg, setAiBootMsg]   = useState('');
-  const [aiBootPct, setAiBootPct]   = useState(0);
-  const [aiError, setAiError]       = useState('');
+  // Face Landmarks Geometry Lock Refs
+  const initialFaceBoxRef = useRef<{ x: number, y: number, w: number, h: number } | null>(null);
+  const initialLandmarksRef = useRef<any>(null);
+  const triggerCaptureOnceRef = useRef<boolean>(false);
+
+  // Smooth Interpolation State Refs
+  const currentDxRef      = useRef(0);
+  const currentDyRef      = useRef(0);
+  const currentRollRef    = useRef(0);
+  const currentScaleRef   = useRef(1);
+  const currentEARRef     = useRef(0.3); // Eye Aspect Ratio
+  const currentMouthRatioRef = useRef(0);
 
   // ── Interaction States ────────────────────────────────────────────────────
-  const [flash, setFlash]           = useState(false);
-  const [smilePct, setSmilePct]     = useState(0);
   const [faceCount, setFaceCount]   = useState(0);
   const [fps, setFps]               = useState(0);
   const [showConsole, setShowConsole] = useState(false);
   const [showCameraPicker, setShowCameraPicker] = useState(false);
+  const [aiState, setAiState]       = useState<'idle' | 'loading' | 'ready'>('idle');
 
   const fpsCountRef = useRef(0);
   const fpsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── AI initialization sequence (starts ONLY after camera is ready) ───────
+  // Camera Management Hook
+  const camera = useCameraManager(videoRef);
+
+  // Ghibli ambient particles
+  const particlesRef = useRef<Particle[]>([]);
+
+  // ── Load face-api model once camera is active ─────────────────────────────
   useEffect(() => {
     if (camera.phase !== 'ready') {
       setAiState('idle');
-      setAiBootPct(0);
-      setAiReady(false);
       return;
     }
-
     setAiState('loading');
-    let active = true;
-
-    const loadModels = async () => {
-      try {
-        setAiBootMsg('Loading ONNX Runtime WebGL engine...');
-        setAiBootPct(20);
-        const ort = await loadORT();
-        ort.env.wasm.numThreads = 1;
-        ortRef.current = ort;
-
-        if (!active) return;
-        setAiBootMsg('Downloading Ghibli style model (~8MB)...');
-        setAiBootPct(55);
-        const session = await ort.InferenceSession.create(
-          'http://localhost:8000/static/models/AnimeGANv2_Hayao.onnx',
-          { executionProviders: ['webgl', 'wasm'], graphOptimizationLevel: 'all' }
-        );
-        sessionRef.current = session;
-
-        if (!active) return;
-        setAiBootMsg('Initializing face analytics parser...');
-        setAiBootPct(85);
-        faceApiRef.current = await loadFaceApi();
-
-        if (!active) return;
-        setAiBootPct(100);
-        setAiState('ready');
-        setAiReady(true);
-      } catch (err: any) {
-        if (active) {
-          console.error('AI load error:', err);
-          setAiState('error');
-          setAiError(err.message || String(err));
-        }
-      }
-    };
-
-    loadModels();
-    return () => {
-      active = false;
-    };
+    loadFaceApi().then((fa) => {
+      faceApiRef.current = fa;
+      setAiState('ready');
+    }).catch(err => {
+      console.error('Face detector load failed:', err);
+    });
   }, [camera.phase]);
 
-  const [aiReady, setAiReady] = useState(false);
+  // ── Load Ghibli Avatar Image once generated ──────────────────────────────
+  useEffect(() => {
+    if (!avatarUrl) {
+      avatarImageRef.current = null;
+      avatarLoadedUrlRef.current = null;
+      return;
+    }
+    if (avatarUrl === avatarLoadedUrlRef.current) return;
 
-  // ── Render loop (requestAnimationFrame) ───────────────────────────────────
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      avatarImageRef.current = img;
+      avatarLoadedUrlRef.current = avatarUrl;
+    };
+    img.src = `http://localhost:8000${avatarUrl}`;
+  }, [avatarUrl]);
+
+  // ── Ghibli particles initialization ──
+  const initParticles = (w: number, h: number) => {
+    if (particlesRef.current.length > 0) return;
+    const colors = ['rgba(110, 231, 183, 0.4)', 'rgba(56, 189, 248, 0.35)', 'rgba(216, 180, 254, 0.3)'];
+    for (let i = 0; i < 20; i++) {
+      particlesRef.current.push({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        vx: (Math.random() - 0.5) * 0.4,
+        vy: -0.3 - Math.random() * 0.5,
+        size: 2 + Math.random() * 4,
+        alpha: 0.1 + Math.random() * 0.5,
+        color: colors[Math.floor(Math.random() * colors.length)]
+      });
+    }
+  };
+
+  const drawParticles = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
+    initParticles(w, h);
+    particlesRef.current.forEach(p => {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, 2 * Math.PI);
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = p.alpha;
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = p.color;
+      ctx.fill();
+      ctx.restore();
+
+      // move
+      p.x += p.vx;
+      p.y += p.vy;
+      // fade out near top
+      if (p.y < 50) p.alpha = Math.max(0, p.alpha - 0.01);
+      // recycle
+      if (p.y < 0 || p.alpha <= 0) {
+        p.x = Math.random() * w;
+        p.y = h + 10;
+        p.vy = -0.3 - Math.random() * 0.5;
+        p.alpha = 0.2 + Math.random() * 0.5;
+      }
+    });
+  };
+
+  // ── Render loop (HTML5 Canvas morphing) ──
   const startMirrorLoop = useCallback(() => {
-    const TARGET_MS = 1000 / 30; // target 30 fps
+    const loop = () => {
+      const video = videoRef.current;
+      const canvas = displayCanvasRef.current;
+      const avatar = avatarImageRef.current;
 
-    const loop = async () => {
-      const video   = videoRef.current;
-      const canvas  = mirrorCanvasRef.current;
-      const session = sessionRef.current;
-      const ort     = ortRef.current;
-      const now     = performance.now();
-      const elapsed = now - lastFrameTime.current;
-
-      if (
-        video &&
-        canvas &&
-        !video.paused &&
-        video.readyState >= 2 &&
-        elapsed >= TARGET_MS
-      ) {
-        lastFrameTime.current = now;
+      if (video && canvas && !video.paused && video.readyState >= 2) {
         const w = canvas.width  = video.videoWidth  || 640;
         const h = canvas.height = video.videoHeight || 480;
         const ctx = canvas.getContext('2d')!;
 
-        // Draw flipped mirror BGR canvas
-        const tmp = document.createElement('canvas');
-        tmp.width = w; tmp.height = h;
-        const tc = tmp.getContext('2d')!;
-        tc.save();
-        tc.translate(w, 0);
-        tc.scale(-1, 1);
-        tc.drawImage(video, 0, 0, w, h);
-        tc.restore();
+        // 1. Render Ghibli Mirror Mode (If avatar is loaded)
+        if (avatar && initialFaceBoxRef.current) {
+          ctx.drawImage(avatar, 0, 0, w, h);
 
-        if (aiReady && session && ort) {
-          if (faceCount > 0) {
-            try {
-              await runAnimeGAN(session, tmp, ctx, w, h, ort);
-              fpsCountRef.current++;
-            } catch (_) {
-              ctx.drawImage(tmp, 0, 0);
-            }
-          } else {
-            // Desaturated background when idle
-            ctx.filter = 'grayscale(70%) brightness(0.4)';
-            ctx.drawImage(tmp, 0, 0);
-            ctx.filter = 'none';
+          // Extract face box dimensions
+          const box = initialFaceBoxRef.current;
+          const cx = box.x + box.w / 2;
+          const cy = box.y + box.h / 2;
+
+          // Apply head movements with linear interpolation (smoothing)
+          ctx.save();
+          ctx.translate(cx, cy);
+          ctx.translate(currentDxRef.current, currentDyRef.current);
+          ctx.rotate(currentRollRef.current);
+          ctx.scale(currentScaleRef.current, currentScaleRef.current);
+          ctx.translate(-cx, -cy);
+
+          // Draw morphed Ghibli Face Layer
+          ctx.drawImage(avatar, box.x, box.y, box.w, box.h, box.x, box.y, box.w, box.h);
+
+          // Eye Blinking Animation (Lightweight Vector Warp)
+          const ear = currentEARRef.current;
+          if (ear < 0.21) {
+            // Draw Ghibli Hand-painted Closed Eyelids over eye regions
+            const eyeYOffset = box.h * 0.38;
+            const eyeW = box.w * 0.12;
+            const eyeH = box.h * 0.05;
+
+            // Left Eye
+            const lex = box.x + box.w * 0.32;
+            const ley = box.y + eyeYOffset;
+            ctx.fillStyle = '#ebd5bb'; // matches average Ghibli skin tone
+            ctx.fillRect(lex - 2, ley - 2, eyeW + 4, eyeH + 4);
+            ctx.beginPath();
+            ctx.ellipse(lex + eyeW / 2, ley + eyeH / 2, eyeW / 2, 1.5, 0, 0, Math.PI);
+            ctx.strokeStyle = '#2d1f18'; // dark sketch lines
+            ctx.lineWidth = 2.2;
+            ctx.stroke();
+
+            // Right Eye
+            const rex = box.x + box.w * 0.56;
+            const rey = box.y + eyeYOffset;
+            ctx.fillStyle = '#ebd5bb';
+            ctx.fillRect(rex - 2, rey - 2, eyeW + 4, eyeH + 4);
+            ctx.beginPath();
+            ctx.ellipse(rex + eyeW / 2, rey + eyeH / 2, eyeW / 2, 1.5, 0, 0, Math.PI);
+            ctx.strokeStyle = '#2d1f18';
+            ctx.lineWidth = 2.2;
+            ctx.stroke();
           }
-        } else {
-          // Draw raw camera feed if models aren't ready yet
+
+          // Mouth expression warp
+          const mouthRatio = currentMouthRatioRef.current;
+          if (mouthRatio > 0.35) {
+            const mx = box.x + box.w * 0.41;
+            const my = box.y + box.h * 0.70;
+            const mw = box.w * 0.18;
+            const mh = box.h * 0.06;
+
+            // Draw cartoonish open mouth
+            ctx.fillStyle = '#ebd5bb';
+            ctx.fillRect(mx - 2, my - 2, mw + 4, mh + 4);
+            ctx.fillStyle = '#a04838'; // red interior
+            ctx.beginPath();
+            ctx.ellipse(mx + mw / 2, my + mh / 2, mw / 2, mh * (mouthRatio * 1.2), 0, 0, 2 * Math.PI);
+            ctx.fill();
+            ctx.strokeStyle = '#2d1f18';
+            ctx.lineWidth = 1.8;
+            ctx.stroke();
+          }
+
+          ctx.restore();
+
+          // Ambient magical effects
+          drawParticles(ctx, w, h);
+          fpsCountRef.current++;
+        }
+        // 2. Render Idle Scenery (No avatar loaded, desaturated grayscale preview)
+        else {
+          const tmp = document.createElement('canvas');
+          tmp.width = w; tmp.height = h;
+          const tc = tmp.getContext('2d')!;
+          tc.save(); tc.translate(w, 0); tc.scale(-1, 1);
+          tc.drawImage(video, 0, 0, w, h);
+          tc.restore();
+
+          ctx.filter = 'grayscale(80%) brightness(0.35) blur(2px)';
           ctx.drawImage(tmp, 0, 0);
+          ctx.filter = 'none';
         }
       }
       rafRef.current = requestAnimationFrame(loop);
     };
-
     rafRef.current = requestAnimationFrame(loop);
-  }, [aiReady, faceCount]);
+  }, [aiReady]);
 
+  // Restart loop on mount
   useEffect(() => {
     cancelAnimationFrame(rafRef.current);
     if (camera.phase === 'ready') {
@@ -293,12 +335,10 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
     return () => cancelAnimationFrame(rafRef.current);
   }, [camera.phase, startMirrorLoop]);
 
-  // ── Face Tracking & Smile Loop ────────────────────────────────────────────
+  // ── Face Tracking Logic ──
   useEffect(() => {
     if (camera.phase !== 'ready' || aiState !== 'ready') {
       setFaceCount(0);
-      setSmilePct(0);
-      if (detectionTimer.current) clearInterval(detectionTimer.current);
       return;
     }
 
@@ -308,75 +348,103 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
 
     detectionTimer.current = setInterval(async () => {
       if (video.paused || video.readyState < 2) return;
-      let count = 0;
-      let smileScore = 0;
 
       try {
-        const opts = new fa.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.45 });
+        const opts = new fa.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.40 });
         const dets = await fa.detectAllFaces(video, opts).withFaceLandmarks(true);
-        count = dets.length;
+        const count = dets.length;
+        setFaceCount(count);
 
-        if (count === 1) {
-          const lm = dets[0].landmarks.positions;
-          const mouthTop    = lm[62]?.y ?? 0;
-          const mouthBottom = lm[66]?.y ?? 0;
-          const mouthLeft   = lm[48]?.x ?? 0;
-          const mouthRight  = lm[54]?.x ?? 0;
-          const opening = Math.abs(mouthBottom - mouthTop);
-          const width   = Math.abs(mouthRight - mouthLeft);
-          const ratio   = width > 0 ? opening / width : 0;
+        if (count === 0) {
+          // Reset when user leaves
+          triggerCaptureOnceRef.current = false;
+          initialFaceBoxRef.current = null;
+          initialLandmarksRef.current = null;
+          onReset();
+        } else if (count === 1) {
+          onFaceDetected();
+          const det = dets[0];
+          const box = det.detection.box;
+          const lm = det.landmarks.positions;
 
-          const cornerLeft  = lm[48];
-          const cornerRight = lm[54];
-          const cornerUp    = lm[51];
-          const cornerLift  = ((cornerLeft.y + cornerRight.y) / 2) - cornerUp.y;
+          // Lock initial face geometry on first step-in
+          if (!initialFaceBoxRef.current) {
+            initialFaceBoxRef.current = {
+              x: box.x,
+              y: box.y,
+              w: box.width,
+              h: box.height
+            };
+            initialLandmarksRef.current = lm;
+          }
 
-          smileScore = Math.min(1, Math.max(0, (cornerLift / 16) * 0.65 + ratio * 0.35));
+          // Trigger backend generation once
+          if (!triggerCaptureOnceRef.current) {
+            triggerCaptureOnceRef.current = true;
+            silentlyCaptureAndSubmit();
+          }
+
+          // Real-time delta tracking relative to the locked initial coordinates
+          const initBox = initialFaceBoxRef.current;
+          const initLm = initialLandmarksRef.current;
+          if (initBox && initLm) {
+            // DX/DY Translation
+            const currentCenter = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+            const initCenter = { x: initBox.x + initBox.w / 2, y: initBox.y + initBox.h / 2 };
+            const targetDx = (initCenter.x - currentCenter.x) * 1.5; // multiplier enhances movement
+            const targetDy = (currentCenter.y - initCenter.y) * 1.5;
+
+            // Roll rotation
+            const initLeftEye = initLm[36];
+            const initRightEye = initLm[45];
+            const currentLeftEye = lm[36];
+            const currentRightEye = lm[45];
+            const initAngle = Math.atan2(initRightEye.y - initLeftEye.y, initRightEye.x - initLeftEye.x);
+            const currentAngle = Math.atan2(currentRightEye.y - currentLeftEye.y, currentRightEye.x - currentLeftEye.x);
+            const targetRoll = initAngle - currentAngle;
+
+            // Distance scaling
+            const initEyeDist = Math.hypot(initRightEye.x - initLeftEye.x, initRightEye.y - initLeftEye.y);
+            const currentEyeDist = Math.hypot(currentRightEye.x - currentLeftEye.x, currentRightEye.y - currentLeftEye.y);
+            const targetScale = initEyeDist > 0 ? currentEyeDist / initEyeDist : 1;
+
+            // Eye Aspect Ratio (Eyelid blink tracking)
+            const leftEyeY = Math.abs((lm[37].y + lm[38].y) / 2 - (lm[41].y + lm[40].y) / 2);
+            const leftEyeX = Math.abs(lm[39].x - lm[36].x);
+            const targetEAR = leftEyeX > 0 ? leftEyeY / leftEyeX : 0.3;
+
+            // Mouth Open Ratio
+            const mouthY = Math.abs(lm[62].y - lm[66].y);
+            const mouthX = Math.abs(lm[54].x - lm[48].x);
+            const targetMouthRatio = mouthX > 0 ? mouthY / mouthX : 0;
+
+            // Linear Interpolation (smoothing / anti-jitter)
+            const LERP_FACTOR = 0.28;
+            currentDxRef.current += (targetDx - currentDxRef.current) * LERP_FACTOR;
+            currentDyRef.current += (targetDy - currentDyRef.current) * LERP_FACTOR;
+            currentRollRef.current += (targetRoll - currentRollRef.current) * LERP_FACTOR;
+            currentScaleRef.current += (targetScale - currentScaleRef.current) * LERP_FACTOR;
+            currentEARRef.current += (targetEAR - currentEARRef.current) * 0.4; // blink is faster
+            currentMouthRatioRef.current += (targetMouthRatio - currentMouthRatioRef.current) * LERP_FACTOR;
+          }
         }
-      } catch (_) {}
-
-      setFaceCount(count);
-
-      if (count === 1 && smileScore > 0.48) {
-        smileTimer.current += 150;
-        setSmilePct(Math.min(100, (smileTimer.current / 3000) * 100));
-        if (smileTimer.current >= 3000) {
-          smileTimer.current = 0;
-          setSmilePct(0);
-          triggerAutoCapture();
-        }
-      } else {
-        smileTimer.current = Math.max(0, smileTimer.current - 120);
-        setSmilePct(Math.max(0, (smileTimer.current / 3000) * 100));
+      } catch (e) {
+        console.error(e);
       }
-    }, 150);
+    }, 120);
 
     return () => {
       if (detectionTimer.current) clearInterval(detectionTimer.current);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [camera.phase, aiState]);
+  }, [camera.phase, aiState, onFaceDetected, onReset]);
 
-  // ── FPS Tracker ───────────────────────────────────────────────────────────
-  useEffect(() => {
-    fpsTimerRef.current = setInterval(() => {
-      setFps(fpsCountRef.current);
-      fpsCountRef.current = 0;
-    }, 1000);
-    return () => {
-      if (fpsTimerRef.current) clearInterval(fpsTimerRef.current);
-    };
-  }, []);
-
-  // ── Capture execution ─────────────────────────────────────────────────────
-  const triggerAutoCapture = useCallback(async () => {
+  // ── Capture and submit ──
+  const silentlyCaptureAndSubmit = async () => {
     const video = videoRef.current;
     if (!video) return;
 
-    setFlash(true);
     playShutter();
-    setTimeout(() => setFlash(false), 350);
-
     try {
       const w = video.videoWidth  || 1280;
       const h = video.videoHeight || 720;
@@ -394,9 +462,20 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
       const photo = await uploadManual(file);
       onCaptured(photo.id, photo.original_url);
     } catch (err: any) {
-      console.error('Mirror auto-capture failed:', err);
+      console.error('Silently capture failed:', err);
     }
-  }, [uploadManual, onCaptured]);
+  };
+
+  // ── FPS Timer ──
+  useEffect(() => {
+    fpsTimerRef.current = setInterval(() => {
+      setFps(fpsCountRef.current);
+      fpsCountRef.current = 0;
+    }, 1000);
+    return () => {
+      if (fpsTimerRef.current) clearInterval(fpsTimerRef.current);
+    };
+  }, []);
 
   const handleFileUpload = async (file: File) => {
     try {
@@ -407,20 +486,8 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
     }
   };
 
-  // ── Computed states ───────────────────────────────────────────────────────
   const isCameraBusy = ['checking', 'requesting', 'initializing'].includes(camera.phase);
   const isCameraError = ['permission_denied', 'not_found', 'in_use', 'disconnected', 'https_required', 'error'].includes(camera.phase);
-
-  // Auto-switch display details based on active camera phase
-  const cameraStatusText = useMemo(() => {
-    switch (camera.phase) {
-      case 'checking': return 'Checking permissions...';
-      case 'requesting': return 'Requesting camera access...';
-      case 'initializing': return 'Starting video feed...';
-      case 'reconnecting': return `Reconnecting camera... Attempt ${camera.retryAttempt} of 5`;
-      default: return 'Loading digital mirror...';
-    }
-  }, [camera.phase, camera.retryAttempt]);
 
   const currentFacingDevice = useMemo(() => {
     return camera.devices.find(d => d.deviceId === camera.activeDeviceId);
@@ -428,27 +495,23 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
 
   return (
     <div className="flex flex-col gap-4 w-full">
-      {/* Probe to help device change checks */}
       <div id="camera-phase-probe" className="hidden" data-phase={camera.phase} />
 
       <div
         className="relative w-full rounded-2xl overflow-hidden bg-[#05050a] border border-white/5 shadow-2xl transition-all duration-500"
         style={{ aspectRatio: '16/9', minHeight: 320 }}
       >
-        {/* Live hidden source element */}
+        {/* Hidden video track element */}
         <video
           ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          className="absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none"
+          autoPlay playsInline muted
+          className="absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none z-0"
         />
 
-        {/* Display rendering canvas */}
+        {/* Morphing avatar canvas viewport */}
         <canvas
-          ref={mirrorCanvasRef}
-          className="absolute inset-0 w-full h-full object-cover"
-          style={{ display: camera.phase === 'ready' ? 'block' : 'none' }}
+          ref={displayCanvasRef}
+          className="absolute inset-0 w-full h-full object-cover z-10"
         />
 
         {/* ── 1. Smart Camera Connecting Overlay ── */}
@@ -456,9 +519,7 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
           {isCameraBusy && (
             <motion.div
               key="camera-connecting"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               className="absolute inset-0 flex flex-col items-center justify-center bg-[#05050a] z-40 p-6"
             >
               <div className="relative mb-6">
@@ -467,13 +528,7 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
                   <div className="absolute inset-0 rounded-full border-2 border-t-emerald-400 border-r-transparent border-b-transparent border-l-transparent animate-spin" />
                 </div>
               </div>
-              <h3 className="font-orbitron font-bold text-xs tracking-widest text-white uppercase mb-2">
-                Connecting Camera
-              </h3>
-              <p className="text-[10px] text-gray-500 font-mono tracking-widest mb-6">
-                {cameraStatusText}
-              </p>
-              {/* Retro progress bar */}
+              <h3 className="font-orbitron font-bold text-xs tracking-widest text-white uppercase mb-2">Connecting Camera</h3>
               <div className="w-32 h-1 bg-white/5 rounded-full overflow-hidden">
                 <div className="h-full bg-emerald-400 animate-pulse" style={{ width: '60%' }} />
               </div>
@@ -486,23 +541,15 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
           {camera.phase === 'reconnecting' && (
             <motion.div
               key="camera-reconnecting"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               className="absolute inset-0 flex flex-col items-center justify-center bg-[#05050a]/90 backdrop-blur-sm z-40 p-6 text-center"
             >
-              <div className="w-12 h-12 rounded-full border border-cyan-500/20 bg-cyan-500/5 flex items-center justify-center mb-4 relative">
+              <div className="w-12 h-12 rounded-full border border-cyan-500/20 bg-cyan-500/5 flex items-center justify-center mb-4">
                 <RefreshCw className="w-5 h-5 text-cyan-400 animate-spin" />
               </div>
-              <h4 className="font-orbitron text-xs text-cyan-300 tracking-widest uppercase mb-1">
-                RECONNECTING CAMERA
-              </h4>
-              <p className="text-[10px] font-mono text-gray-400 mb-3">
-                Attempt {camera.retryAttempt} of {camera.maxRetries}
-              </p>
-              <p className="text-[9px] font-mono text-gray-500">
-                Next attempt in {camera.nextRetryIn}s...
-              </p>
+              <h4 className="font-orbitron text-xs text-cyan-300 tracking-widest uppercase mb-1">RECONNECTING CAMERA</h4>
+              <p className="text-[10px] font-mono text-gray-400 mb-3">Attempt {camera.retryAttempt} of 5</p>
+              <p className="text-[9px] font-mono text-gray-500">Next attempt in {camera.nextRetryIn}s...</p>
               <button
                 onClick={camera.retryNow}
                 className="mt-6 font-orbitron text-[9px] tracking-widest border border-cyan-500/40 hover:border-cyan-400 px-4 py-2 rounded-lg text-cyan-400 hover:bg-cyan-500/10 transition-colors"
@@ -518,59 +565,39 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
           {isCameraError && (
             <motion.div
               key="camera-error"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               className="absolute inset-0 flex flex-col items-center justify-center bg-[#05050a] z-40 p-8 text-center"
             >
-              <div className="w-14 h-14 rounded-full bg-red-500/10 border border-red-500/30 flex items-center justify-center mb-4 shadow-[0_0_15px_rgba(239,68,68,0.05)]">
+              <div className="w-14 h-14 rounded-full bg-red-500/10 border border-red-500/30 flex items-center justify-center mb-4">
                 <AlertCircle className="w-6 h-6 text-red-400" />
               </div>
 
               {camera.phase === 'permission_denied' ? (
                 <>
-                  <h3 className="font-orbitron text-xs text-white tracking-widest uppercase mb-2">
-                    Allow Camera Access
-                  </h3>
-                  <p className="text-xs text-gray-400 max-w-sm leading-relaxed mb-6">
-                    This Ghibli Portrait Studio requires camera access. Please approve the prompt or click Enable Camera to check again.
-                  </p>
+                  <h3 className="font-orbitron text-xs text-white tracking-widest uppercase mb-2">Allow Camera Access</h3>
+                  <p className="text-xs text-gray-400 max-w-sm leading-relaxed mb-6">Camera permission is blocked. Click Enable Camera to check again.</p>
                   <button
                     onClick={camera.retryNow}
-                    className="font-orbitron text-xs tracking-widest bg-emerald-500 hover:bg-emerald-400 px-6 py-3 rounded-xl text-white font-bold transition-all shadow-[0_4px_12px_rgba(16,185,129,0.2)]"
+                    className="font-orbitron text-xs tracking-widest bg-emerald-500 hover:bg-emerald-400 px-6 py-3 rounded-xl text-white font-bold transition-all"
                   >
                     ENABLE CAMERA
                   </button>
                 </>
               ) : camera.phase === 'https_required' ? (
                 <>
-                  <h3 className="font-orbitron text-xs text-red-400 tracking-widest uppercase mb-2">
-                    HTTPS connection required
-                  </h3>
-                  <p className="text-xs text-gray-500 max-w-sm leading-relaxed">
-                    Browser security protocols prevent access to camera streams over standard HTTP. Please open this app using a secure HTTPS connection.
-                  </p>
+                  <h3 className="font-orbitron text-xs text-red-400 tracking-widest uppercase mb-2">HTTPS connection required</h3>
+                  <p className="text-xs text-gray-500 max-w-sm leading-relaxed">Camera streams require a secure HTTPS connection.</p>
                 </>
               ) : (
                 <>
-                  <h3 className="font-orbitron text-xs text-white tracking-widest uppercase mb-2">
-                    {camera.phase === 'disconnected' ? 'CAMERA DISCONNECTED' : 'CAMERA OFFLINE'}
-                  </h3>
-                  <p className="text-xs text-gray-400 max-w-sm leading-relaxed mb-6">
-                    {camera.errorMessage || 'Unable to connect to camera device.'}
-                  </p>
+                  <h3 className="font-orbitron text-xs text-white tracking-widest uppercase mb-2">{camera.phase === 'disconnected' ? 'CAMERA DISCONNECTED' : 'CAMERA OFFLINE'}</h3>
+                  <p className="text-xs text-gray-400 max-w-sm leading-relaxed mb-6">{camera.errorMessage}</p>
                   <div className="flex gap-3">
                     <button
                       onClick={camera.retryNow}
                       className="font-orbitron text-xs tracking-widest border border-white/10 hover:border-white/30 px-5 py-2.5 rounded-lg text-white hover:bg-white/5 transition-colors"
                     >
                       RETRY
-                    </button>
-                    <button
-                      onClick={() => fileInputRef.current?.click()}
-                      className="font-orbitron text-xs tracking-widest border border-emerald-500/40 hover:border-emerald-400 px-5 py-2.5 rounded-lg text-emerald-400 hover:bg-emerald-500/10 transition-colors"
-                    >
-                      UPLOAD PHOTO
                     </button>
                   </div>
                 </>
@@ -579,15 +606,13 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
           )}
         </AnimatePresence>
 
-        {/* ── 4. AI Model Initializing Overlay (Loaded only when camera is up) ── */}
+        {/* ── 4. AI Pipeline Initialization Loading Screen ── */}
         <AnimatePresence>
           {camera.phase === 'ready' && aiState === 'loading' && (
             <motion.div
               key="ai-loading"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="absolute inset-0 flex flex-col items-center justify-center bg-[#05050a]/80 backdrop-blur-md z-30 p-6 text-center"
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="absolute inset-0 flex flex-col items-center justify-center bg-[#05050a] z-30 p-6 text-center"
             >
               <div className="relative mb-6">
                 <div className="w-16 h-16 rounded-full border border-emerald-400/20 flex items-center justify-center relative">
@@ -595,28 +620,54 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
                   <Sparkles className="w-6 h-6 text-emerald-300 animate-pulse" />
                 </div>
               </div>
-              <h4 className="font-orbitron font-bold text-xs text-white tracking-widest uppercase mb-1">
-                Initializing AI Mirror
-              </h4>
-              <p className="text-[10px] text-emerald-400 font-mono tracking-wider animate-pulse mb-6">
-                {aiBootMsg}
-              </p>
-              {/* Progress bar */}
-              <div className="w-40 h-1 bg-white/5 rounded-full overflow-hidden">
-                <div className="h-full bg-gradient-to-r from-emerald-400 to-cyan-400 transition-all duration-300" style={{ width: `${aiBootPct}%` }} />
-              </div>
+              <h4 className="font-orbitron font-bold text-xs text-white tracking-widest uppercase mb-1">Connecting AI Mirror</h4>
+              <p className="text-[10px] text-emerald-400 font-mono tracking-wider animate-pulse mb-6">Loading face alignment engines...</p>
             </motion.div>
           )}
         </AnimatePresence>
 
-        {/* ── 5. Idle Ghibli Painted Scenery Overlay (When ready, but no face detected) ── */}
+        {/* ── 5. Full-Screen Portrait Generation Loading Overlay ── */}
+        <AnimatePresence>
+          {camera.phase === 'ready' && aiState === 'ready' && faceCount === 1 && !avatarUrl && (
+            <motion.div
+              key="generation-loading"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 flex flex-col items-center justify-center bg-[#05050a] z-30 p-6 text-center"
+            >
+              <div className="relative mb-6">
+                <div className="w-20 h-20 rounded-full bg-gradient-to-br from-emerald-500/20 via-cyan-400/10 to-purple-500/20 blur-xl animate-pulse absolute inset-0" />
+                <div className="w-20 h-20 rounded-full border border-emerald-400/30 flex items-center justify-center relative">
+                  <div className="absolute inset-0 rounded-full border-t-2 border-emerald-400 animate-spin" />
+                  <Sparkles className="w-8 h-8 text-emerald-300 animate-pulse" />
+                </div>
+              </div>
+              <h4 className="font-orbitron font-bold text-xs text-white tracking-widest uppercase mb-2">
+                ✨ Creating your Studio Ghibli portrait...
+              </h4>
+              <p className="text-[10px] text-emerald-400 font-mono tracking-wider mb-6 animate-pulse">
+                {generationStatus || 'Synthesizing neural features...'}
+              </p>
+              {/* Progress bar */}
+              <div className="w-48 h-1 bg-white/5 rounded-full overflow-hidden">
+                <motion.div
+                  className="h-full bg-gradient-to-r from-emerald-400 to-cyan-400"
+                  animate={{ width: `${generationProgress}%` }}
+                  transition={{ duration: 0.3 }}
+                />
+              </div>
+              <p className="text-white/20 text-[9px] font-mono mt-3">{generationProgress}%</p>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* ── 6. Idle Landscape Overlay (No Face Detected) ── */}
         <AnimatePresence>
           {camera.phase === 'ready' && aiState === 'ready' && faceCount === 0 && (
             <motion.div
               key="idle-scene"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.8 }}
               className="absolute inset-0 z-20 pointer-events-none"
             >
@@ -626,7 +677,6 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
                   background: 'linear-gradient(180deg, #12122b 0%, #1e1240 30%, #32194c 55%, #582960 75%, #7e4368 90%, #9e5d4d 100%)',
                 }}
               />
-              {/* Sparkle Stars */}
               {[...Array(25)].map((_, i) => (
                 <div
                   key={i}
@@ -642,7 +692,6 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
                   }}
                 />
               ))}
-              {/* Moon */}
               <div
                 className="absolute rounded-full"
                 style={{
@@ -656,21 +705,6 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
                 <path d="M0,180 C100,125 200,165 300,145 C400,125 500,175 600,150 C700,125 750,160 800,145 L800,200 L0,200 Z" fill="#203d0f" />
                 <path d="M0,195 C80,160 180,190 280,170 C380,150 480,190 580,172 C680,155 740,180 800,167 L800,200 L0,200 Z" fill="#14260a" />
               </svg>
-              {/* Floating Spirits */}
-              {[...Array(4)].map((_, i) => (
-                <motion.div
-                  key={i}
-                  className="absolute rounded-full bg-white/15 blur-[3px]"
-                  style={{
-                    width: 10 + i * 3,
-                    height: 10 + i * 3,
-                    bottom: `${12 + i * 6}%`,
-                    left: `${15 + i * 22}%`,
-                  }}
-                  animate={{ y: [-6, 6, -6] }}
-                  transition={{ duration: 3.5 + i * 0.4, repeat: Infinity, ease: 'easeInOut', delay: i * 0.3 }}
-                />
-              ))}
               <div className="absolute inset-0 flex flex-col items-center justify-center">
                 <motion.div
                   animate={{ y: [-3, 3, -3] }}
@@ -681,7 +715,7 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
                     ✨ STEP IN FRONT OF THE CAMERA
                   </p>
                   <p className="text-white/40 text-[10px] font-sans tracking-wide">
-                    Portrait rendering starts instantly
+                    Portrait rendering starts automatically
                   </p>
                 </motion.div>
               </div>
@@ -689,36 +723,31 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
           )}
         </AnimatePresence>
 
-        {/* ── 6. Flash Shutter Overlay ── */}
+        {/* ── 7. Flash Overlay ── */}
         <AnimatePresence>
           {flash && (
             <motion.div
               key="flash-shutter"
-              initial={{ opacity: 1 }}
-              animate={{ opacity: 0 }}
+              initial={{ opacity: 1 }} animate={{ opacity: 0 }}
               transition={{ duration: 0.35 }}
               className="absolute inset-0 bg-white z-50 pointer-events-none"
             />
           )}
         </AnimatePresence>
 
-        {/* ── 7. Active HUD display details (LIVE + FPS + Camera label) ── */}
-        {camera.phase === 'ready' && (
+        {/* ── 8. Active HUD Overlays (Only when camera is ready & avatar is active) ── */}
+        {camera.phase === 'ready' && avatarUrl && (
           <>
-            {/* Live Indicator */}
             <div className="absolute top-3 left-3 z-20 flex items-center gap-2">
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/60 border border-white/10 text-[9px] font-orbitron text-emerald-400 tracking-widest">
                 <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-ping" />
                 LIVE
               </div>
-              {aiState === 'ready' && (
-                <div className="px-2 py-1 rounded-full bg-black/60 border border-white/10 text-[9px] font-mono text-white/50">
-                  {fps} FPS
-                </div>
-              )}
+              <div className="px-2 py-1 rounded-full bg-black/60 border border-white/10 text-[9px] font-mono text-white/50">
+                {fps} FPS
+              </div>
             </div>
 
-            {/* Selected Camera Label */}
             {currentFacingDevice && (
               <div className="absolute top-3 right-3 z-20">
                 <div className="px-2.5 py-1 rounded-full bg-black/60 border border-white/10 text-[9px] font-orbitron text-gray-400 tracking-wider flex items-center gap-1">
@@ -729,42 +758,10 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
                 </div>
               </div>
             )}
-
-            {/* Capture Smile Tracker progress circle */}
-            {smilePct > 4 && (
-              <motion.div
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1"
-              >
-                <div className="relative w-11 h-11">
-                  <svg className="w-11 h-11 -rotate-90" viewBox="0 0 48 48">
-                    <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="3.5" />
-                    <circle
-                      cx="24"
-                      cy="24"
-                      r="20"
-                      fill="none"
-                      stroke="#10b981"
-                      strokeWidth="3.5"
-                      strokeLinecap="round"
-                      strokeDasharray={`${2 * Math.PI * 20}`}
-                      strokeDashoffset={`${2 * Math.PI * 20 * (1 - smilePct / 100)}`}
-                      style={{ transition: 'stroke-dashoffset 0.12s ease' }}
-                    />
-                  </svg>
-                  <div className="absolute inset-0 flex items-center justify-center text-xs select-none">😊</div>
-                </div>
-                <p className="text-[8px] font-orbitron text-emerald-400 tracking-widest">
-                  {smilePct < 100 ? 'HOLD SMILE' : 'CAPTURING'}
-                </p>
-              </motion.div>
-            )}
           </>
         )}
 
-        {/* File upload hidden triggers */}
+        {/* Hidden upload inputs */}
         <input
           ref={fileInputRef}
           type="file"
@@ -776,7 +773,7 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
           }}
         />
 
-        {/* Dynamic actions toggler bar (Bottom Right) */}
+        {/* Action Toggle Bar */}
         {!isCameraBusy && camera.phase !== 'https_required' && (
           <div className="absolute bottom-3 right-3 z-20 flex gap-2">
             {camera.devices.length > 1 && (
@@ -799,12 +796,10 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
         )}
       </div>
 
-      {/* ── 8. Active Camera Selector Panel ── */}
+      {/* Camera switcher panel */}
       {showCameraPicker && camera.devices.length > 1 && (
         <div className="w-full bg-[#0b0b14] border border-white/5 rounded-xl p-3 flex flex-col gap-2">
-          <p className="text-[10px] font-orbitron text-gray-400 tracking-widest uppercase mb-1">
-            Choose Camera Device
-          </p>
+          <p className="text-[10px] font-orbitron text-gray-400 tracking-widest uppercase mb-1">Choose Camera Device</p>
           <div className="flex flex-col gap-1">
             {camera.devices.map(d => (
               <button
@@ -827,7 +822,7 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
         </div>
       )}
 
-      {/* ── 9. Structured Diagnostic Logs Console ── */}
+      {/* Structured Terminal Console */}
       <div className="w-full bg-[#08080f] border border-white/5 rounded-xl p-3 flex flex-col gap-2">
         <button
           onClick={() => setShowConsole(!showConsole)}
