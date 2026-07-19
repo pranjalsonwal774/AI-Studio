@@ -130,6 +130,8 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
   const [showConsole, setShowConsole] = useState(false);
   const [showCameraPicker, setShowCameraPicker] = useState(false);
   const [aiState, setAiState]       = useState<'idle' | 'loading' | 'ready'>('idle');
+  const [flash, setFlash]           = useState(false);
+  const [smilePct, setSmilePct]     = useState(0);
 
   const fpsCountRef = useRef(0);
   const fpsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -324,7 +326,7 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
-  }, [aiReady]);
+  }, [aiState, faceCount]);
 
   // Restart loop on mount
   useEffect(() => {
