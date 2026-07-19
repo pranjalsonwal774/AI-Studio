@@ -17,7 +17,13 @@ class RedisCacheService:
         try:
             logger.info(f"Connecting to Redis at: {self.host}:{self.port}")
             self.client = redis.Redis(
-                host=self.host, port=self.port, db=self.db, socket_timeout=2.0
+                host=self.host,
+                port=self.port,
+                db=self.db,
+                socket_timeout=1.0,
+                socket_connect_timeout=1.0,
+                retry_on_timeout=False,
+                retry=None
             )
             self.client.ping()
             logger.info("Successfully connected to Redis.")

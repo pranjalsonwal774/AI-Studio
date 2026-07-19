@@ -13,7 +13,7 @@ try:
     # Try PostgreSQL first
     db_url = settings.DATABASE_URL
     logger.info(f"Connecting to database at: {settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}")
-    engine = create_engine(db_url, pool_pre_ping=True, pool_size=10, max_overflow=20)
+    engine = create_engine(db_url, pool_pre_ping=True, pool_size=10, max_overflow=20, connect_args={"connect_timeout": 2})
     # Check if connection can be established
     with engine.connect() as conn:
         pass
