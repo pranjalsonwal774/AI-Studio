@@ -18,6 +18,26 @@ try:
 except Exception as e:
     logger.error(f"Failed to create database schemas: {e}")
 
+# Ensure Ghibli ONNX model is available in static directory for client-side WebGL download
+try:
+    static_models_dir = os.path.join(settings.LOCAL_STORAGE_DIR, "models")
+    os.makedirs(static_models_dir, exist_ok=True)
+    static_model_path = os.path.join(static_models_dir, "AnimeGANv2_Hayao.onnx")
+    cache_model_path = os.path.join(settings.MODEL_CACHE_DIR, "AnimeGANv2_Hayao.onnx")
+    
+    if os.path.exists(cache_model_path):
+        import shutil
+        if not os.path.exists(static_model_path) or os.path.getsize(static_model_path) != os.path.getsize(cache_model_path):
+            shutil.copy2(cache_model_path, static_model_path)
+            logger.info(f"Copied Ghibli model to static directory: {static_model_path}")
+    else:
+        if not os.path.exists(static_model_path):
+            from backend.pipelines.mock_pipeline import ANIMEGAN_PRIMARY_URL, _download_model
+            logger.info("Ghibli model not found in cache. Downloading directly to static folder...")
+            _download_model(ANIMEGAN_PRIMARY_URL, static_model_path)
+except Exception as model_err:
+    logger.error(f"Failed to prepare static model: {model_err}")
+
 # Rate limiter instance (applied globally to APIs, bypassed for WebSockets and downloads)
 limiter = RateLimiter(requests_per_minute=120)
 

@@ -3,23 +3,13 @@ import React, {
   useRef,
   useState,
   useCallback,
-  useMemo,
 } from 'react';
-import {
-  Camera,
-  CameraOff,
-  AlertTriangle,
-  RefreshCw,
-  Upload,
-  User,
-  Wind,
-} from 'lucide-react';
+import { Upload, Sparkles, Camera, Wifi } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
-
 interface CameraFeedProps {
   style: string;
   background: string;
@@ -27,63 +17,123 @@ interface CameraFeedProps {
   uploadManual: (file: File) => Promise<any>;
 }
 
-type BoothPhase =
-  | 'loading'      // camera initialising
-  | 'permission'   // waiting for camera permission
-  | 'error'        // camera error
-  | 'waiting'      // camera live, no person detected
-  | 'detected'     // person detected, running countdown
-  | 'hold_still'   // person moved during countdown
-  | 'capturing'    // flash + uploading
-  | 'uploading';   // sending to backend
+type MirrorPhase =
+  | 'boot'          // loading ONNX model
+  | 'idle'          // camera live, no person detected
+  | 'mirror'        // live Ghibli mirror active
+  | 'autocapture'   // smile+stable → capturing HQ photo
+  | 'error';        // camera or model failed
 
-interface FaceBox {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function playShutter() {
+  try {
+    const AC = window.AudioContext || (window as any).webkitAudioContext;
+    const ctx = new AC();
+    const buf = ctx.createBuffer(1, ctx.sampleRate * 0.08, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++)
+      d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.010));
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.7, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
+    src.connect(g); g.connect(ctx.destination); src.start();
+  } catch (_) { /* silence */ }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shutter sound (Web Audio API — no external file needed)
+// Load face-api.js from CDN
 // ─────────────────────────────────────────────────────────────────────────────
-function playShutterSound() {
-  try {
-    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
-
-    // Click transient
-    const buf = ctx.createBuffer(1, ctx.sampleRate * 0.08, ctx.sampleRate);
-    const data = buf.getChannelData(0);
-    for (let i = 0; i < data.length; i++) {
-      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.012));
-    }
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-
-    // High-pass to make it crisp
-    const hpf = ctx.createBiquadFilter();
-    hpf.type = 'highpass';
-    hpf.frequency.value = 800;
-
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0.6, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-
-    src.connect(hpf);
-    hpf.connect(gain);
-    gain.connect(ctx.destination);
-    src.start();
-  } catch (_) {
-    // Ignore audio errors silently
+async function loadFaceApi(): Promise<any> {
+  if ((window as any).faceapi?.nets?.tinyFaceDetector?.isLoaded) return (window as any).faceapi;
+  if (!(window as any).faceapi) {
+    await new Promise<void>((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/dist/face-api.js';
+      s.async = true; s.onload = () => res(); s.onerror = rej;
+      document.head.appendChild(s);
+    });
   }
+  const fa = (window as any).faceapi;
+  const M = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+  await Promise.all([
+    fa.nets.tinyFaceDetector.loadFromUri(M),
+    fa.nets.faceLandmark68TinyNet.loadFromUri(M),
+  ]);
+  return fa;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load ONNX Runtime Web from CDN
+// ─────────────────────────────────────────────────────────────────────────────
+async function loadORT(): Promise<any> {
+  if ((window as any).ort) return (window as any).ort;
+  await new Promise<void>((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js';
+    s.async = true; s.onload = () => res(); s.onerror = rej;
+    document.head.appendChild(s);
+  });
+  return (window as any).ort;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Run AnimeGANv2 inference on a single canvas/image source
+// Input: [1,3,512,512] NCHW float32 in [-1,1]
+// Output: [1,3,512,512] NCHW float32 in [-1,1]
+// ─────────────────────────────────────────────────────────────────────────────
+async function runAnimeGAN(
+  session: any,
+  srcCanvas: HTMLCanvasElement,
+  outCtx: CanvasRenderingContext2D,
+  outW: number,
+  outH: number,
+  ort: any
+): Promise<void> {
+  const SIZE = 512;
+  const tmp = document.createElement('canvas');
+  tmp.width = SIZE; tmp.height = SIZE;
+  const tc = tmp.getContext('2d')!;
+  tc.drawImage(srcCanvas, 0, 0, SIZE, SIZE);
+  const imgData = tc.getImageData(0, 0, SIZE, SIZE);
+  const { data } = imgData;
+
+  // RGBA → NCHW float32 normalized to [-1,1]
+  const float32 = new Float32Array(3 * SIZE * SIZE);
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    float32[i]                  = (data[i * 4]     / 127.5) - 1.0; // R
+    float32[SIZE * SIZE + i]    = (data[i * 4 + 1] / 127.5) - 1.0; // G
+    float32[SIZE * SIZE * 2 + i] = (data[i * 4 + 2] / 127.5) - 1.0; // B
+  }
+
+  const tensor = new ort.Tensor('float32', float32, [1, 3, SIZE, SIZE]);
+  const feeds: Record<string, any> = {};
+  feeds[session.inputNames[0]] = tensor;
+  const results = await session.run(feeds);
+  const out = results[session.outputNames[0]].data as Float32Array;
+
+  // NCHW → RGBA ImageData
+  const outImg = outCtx.createImageData(SIZE, SIZE);
+  const od = outImg.data;
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    od[i * 4]     = Math.min(255, Math.max(0, (out[i]                   + 1.0) * 127.5));
+    od[i * 4 + 1] = Math.min(255, Math.max(0, (out[SIZE * SIZE + i]     + 1.0) * 127.5));
+    od[i * 4 + 2] = Math.min(255, Math.max(0, (out[SIZE * SIZE * 2 + i] + 1.0) * 127.5));
+    od[i * 4 + 3] = 255;
+  }
+  // Draw scaled up to outW × outH
+  const scaleTmp = document.createElement('canvas');
+  scaleTmp.width = SIZE; scaleTmp.height = SIZE;
+  scaleTmp.getContext('2d')!.putImageData(outImg, 0, 0);
+  outCtx.drawImage(scaleTmp, 0, 0, outW, outH);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main Component
 // ─────────────────────────────────────────────────────────────────────────────
-
 export const CameraFeed: React.FC<CameraFeedProps> = ({
   style,
   background,
@@ -91,760 +141,626 @@ export const CameraFeed: React.FC<CameraFeedProps> = ({
   uploadManual,
 }) => {
   // ── Refs ──────────────────────────────────────────────────────────────────
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const hiddenCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const animFrameRef = useRef<number>(0);
-  const lastFaceBoxRef = useRef<FaceBox | null>(null);
-  const countdownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const videoRef        = useRef<HTMLVideoElement>(null);
+  const mirrorCanvasRef = useRef<HTMLCanvasElement>(null); // displayed Ghibli canvas
+  const fileInputRef    = useRef<HTMLInputElement>(null);
+  const streamRef       = useRef<MediaStream | null>(null);
+  const sessionRef      = useRef<any>(null);
+  const ortRef          = useRef<any>(null);
+  const faceApiRef      = useRef<any>(null);
+  const rafRef          = useRef<number>(0);
+  const detectionTimer  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const smileTimer      = useRef<number>(0);       // ms of continuous smile
+  const lastFrameTime   = useRef<number>(0);
 
   // ── State ─────────────────────────────────────────────────────────────────
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [phase, setPhase] = useState<BoothPhase>('loading');
-  const [cameraError, setCameraError] = useState<string>('');
-  const [countdown, setCountdown] = useState<number>(5);
-  const [flashActive, setFlashActive] = useState(false);
-  const [modelsReady, setModelsReady] = useState(false);
-  const [faceDetected, setFaceDetected] = useState(false);
+  const [phase, setPhase]           = useState<MirrorPhase>('boot');
+  const [bootMsg, setBootMsg]       = useState('Loading neural engine...');
+  const [bootPct, setBootPct]       = useState(0);
+  const [errorMsg, setErrorMsg]     = useState('');
+  const [flash, setFlash]           = useState(false);
+  const [smilePct, setSmilePct]     = useState(0);   // 0-100 for smile ring
+  const [faceCount, setFaceCount]   = useState(0);
+  const [fps, setFps]               = useState(0);
+  const fpsCountRef = useRef(0);
+  const fpsTimer    = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── Load face-api models ──────────────────────────────────────────────────
-  useEffect(() => {
-    let cancelled = false;
+  // ─────────────────────────────────────────────────────────────────────────
+  // Boot sequence: camera → ORT → model → face-api
+  // ─────────────────────────────────────────────────────────────────────────
+  const boot = useCallback(async () => {
+    setPhase('boot');
+    setBootPct(0);
+    setBootMsg('Requesting camera access...');
 
-    const load = async () => {
-      try {
-        if ((window as any).faceapi?.nets?.tinyFaceDetector?.isLoaded) {
-          if (!cancelled) setModelsReady(true);
-          return;
-        }
-
-        if (!(window as any).faceapi) {
-          await new Promise<void>((resolve, reject) => {
-            const s = document.createElement('script');
-            s.src =
-              'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/dist/face-api.js';
-            s.async = true;
-            s.onload = () => resolve();
-            s.onerror = () => reject(new Error('CDN load failed'));
-            document.head.appendChild(s);
-          });
-        }
-
-        const fa = (window as any).faceapi;
-        const MODEL =
-          'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
-        await Promise.all([
-          fa.nets.tinyFaceDetector.loadFromUri(MODEL),
-          fa.nets.faceLandmark68TinyNet.loadFromUri(MODEL),
-        ]);
-
-        if (!cancelled) {
-          setModelsReady(true);
-        }
-      } catch (e) {
-        console.warn('face-api load failed (non-critical):', e);
-        if (!cancelled) setModelsReady(true); // still run without face tracking
-      }
-    };
-
-    load();
-    return () => { cancelled = true; };
-  }, []);
-
-  // ── Camera helpers ────────────────────────────────────────────────────────
-
-  const releaseCamera = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    cancelAnimationFrame(animFrameRef.current);
-    if (countdownTimerRef.current) {
-      clearTimeout(countdownTimerRef.current);
-    }
-    lastFaceBoxRef.current = null;
-  }, []);
-
-  const enumerateDevices = useCallback(async () => {
+    // 1. Camera
     try {
-      const all = await navigator.mediaDevices.enumerateDevices();
-      const cams = all.filter((d) => d.kind === 'videoinput');
-      setDevices(cams);
-      return cams;
-    } catch {
-      return [];
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+        audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => {});
+      }
+    } catch (e: any) {
+      setErrorMsg('Camera access denied. Allow camera and reload.');
+      setPhase('error');
+      return;
     }
+    setBootPct(25);
+
+    // 2. Load ORT
+    setBootMsg('Loading ONNX Runtime WebGL engine...');
+    try {
+      const ort = await loadORT();
+      ort.env.wasm.numThreads = 1;
+      ortRef.current = ort;
+    } catch (e) {
+      setErrorMsg('Failed to load ONNX Runtime. Check your internet connection.');
+      setPhase('error');
+      return;
+    }
+    setBootPct(50);
+
+    // 3. Download + load ONNX model
+    setBootMsg('Downloading Ghibli style model (~8MB)...');
+    try {
+      const ort = ortRef.current;
+      const modelUrl = 'http://localhost:8000/static/models/AnimeGANv2_Hayao.onnx';
+      const opt = {
+        executionProviders: ['webgl', 'wasm'],
+        graphOptimizationLevel: 'all',
+      };
+      const session = await ort.InferenceSession.create(modelUrl, opt);
+      sessionRef.current = session;
+    } catch (e: any) {
+      setErrorMsg(`Model load failed: ${e?.message || e}`);
+      setPhase('error');
+      return;
+    }
+    setBootPct(80);
+
+    // 4. Load face-api
+    setBootMsg('Loading face detection models...');
+    try {
+      faceApiRef.current = await loadFaceApi();
+    } catch (_) {
+      // face-api failing is non-critical — we just won't do smile detection
+      console.warn('face-api failed to load; smile detection disabled.');
+    }
+    setBootPct(100);
+
+    // Done
+    setPhase('idle');
+    startMirrorLoop();
+    startDetectionLoop();
+    startFpsMeter();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const startCamera = useCallback(
-    async (deviceId?: string) => {
-      releaseCamera();
-      setPhase('loading');
-      setCameraError('');
-
-      // First do a quick permission probe to get device labels
-      try {
-        const probe = await navigator.mediaDevices.getUserMedia({ video: true });
-        probe.getTracks().forEach((t) => t.stop());
-      } catch (err: any) {
-        const msg =
-          err.name === 'NotAllowedError'
-            ? 'Camera permission denied. Allow camera access in your browser and refresh.'
-            : err.name === 'NotFoundError'
-            ? 'No webcam found. Connect a camera and try again.'
-            : `Camera error: ${err.message}`;
-        setCameraError(msg);
-        setPhase('error');
-        return;
-      }
-
-      const cams = await enumerateDevices();
-      const targetId = deviceId || selectedDeviceId || (cams[0]?.deviceId ?? '');
-      if (targetId && !deviceId) setSelectedDeviceId(targetId);
-
-      // Try the target device first, then fall back to others
-      const order = targetId
-        ? [targetId, ...cams.map((d) => d.deviceId).filter((id) => id !== targetId)]
-        : cams.map((d) => d.deviceId);
-
-      if (order.length === 0) order.push('');
-
-      let started = false;
-      for (const id of order) {
-        try {
-          const constraints: MediaStreamConstraints = {
-            video: id
-              ? {
-                  deviceId: { exact: id },
-                  width: { ideal: 1920, min: 640 },
-                  height: { ideal: 1080, min: 480 },
-                  frameRate: { ideal: 30 },
-                }
-              : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
-            audio: false,
-          };
-
-          const stream = await navigator.mediaDevices.getUserMedia(constraints);
-          streamRef.current = stream;
-
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream;
-            await videoRef.current.play().catch(() => {});
-          }
-
-          if (id) setSelectedDeviceId(id);
-          setPhase('waiting');
-          started = true;
-          break;
-        } catch (err: any) {
-          console.warn(`Camera ${id} failed:`, err.message);
-        }
-      }
-
-      if (!started) {
-        setCameraError(
-          'Could not open any webcam. Check connections and try again, or upload a photo.'
-        );
-        setPhase('error');
-      }
-    },
-    [enumerateDevices, releaseCamera, selectedDeviceId]
-  );
-
-  // ── Auto-start on mount ───────────────────────────────────────────────────
   useEffect(() => {
-    startCamera();
+    boot();
     return () => {
-      releaseCamera();
+      stopAll();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Bind stream whenever videoRef or stream changes ───────────────────────
-  // This effect is the DEFINITIVE way to attach a stream to a video element.
+  // Rebind srcObject on every render so it never loses the stream
   useEffect(() => {
-    const video = videoRef.current;
-    const stream = streamRef.current;
-    if (!video || !stream) return;
-    if (video.srcObject !== stream) {
-      video.srcObject = stream;
-      video.play().catch(() => {});
+    const v = videoRef.current;
+    const s = streamRef.current;
+    if (v && s && v.srcObject !== s) {
+      v.srcObject = s;
+      v.play().catch(() => {});
     }
   });
 
-  // ── Countdown management ─────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // Mirror render loop (requestAnimationFrame)
+  // ─────────────────────────────────────────────────────────────────────────
+  const startMirrorLoop = useCallback(() => {
+    const TARGET_MS = 1000 / 30; // 30 FPS cap to let GPU breathe
 
-  const abortCountdown = useCallback(() => {
-    if (countdownTimerRef.current) {
-      clearTimeout(countdownTimerRef.current);
-      countdownTimerRef.current = null;
+    const loop = async () => {
+      const now = performance.now();
+      const elapsed = now - lastFrameTime.current;
+
+      const video   = videoRef.current;
+      const canvas  = mirrorCanvasRef.current;
+      const session = sessionRef.current;
+      const ort     = ortRef.current;
+
+      if (
+        video &&
+        canvas &&
+        session &&
+        ort &&
+        !video.paused &&
+        video.readyState >= 2 &&
+        elapsed >= TARGET_MS
+      ) {
+        lastFrameTime.current = now;
+        const w = canvas.width  = video.videoWidth  || 640;
+        const h = canvas.height = video.videoHeight || 480;
+
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          // Draw mirrored video onto offscreen temp canvas
+          const tmp = document.createElement('canvas');
+          tmp.width = w; tmp.height = h;
+          const tc = tmp.getContext('2d')!;
+          tc.save();
+          tc.translate(w, 0);
+          tc.scale(-1, 1);
+          tc.drawImage(video, 0, 0, w, h);
+          tc.restore();
+
+          // Run style transfer if mirror mode
+          if (phase === 'mirror' || phase === 'autocapture') {
+            try {
+              await runAnimeGAN(session, tmp, ctx, w, h, ort);
+              fpsCountRef.current++;
+            } catch (_) {
+              // Fallback: just draw raw mirrored video
+              ctx.drawImage(tmp, 0, 0);
+            }
+          } else {
+            // Idle — draw soft-desaturated video as background hint
+            ctx.filter = 'grayscale(80%) brightness(0.4)';
+            ctx.drawImage(tmp, 0, 0);
+            ctx.filter = 'none';
+          }
+        }
+      }
+
+      rafRef.current = requestAnimationFrame(loop);
+    };
+
+    rafRef.current = requestAnimationFrame(loop);
+  }, [phase]);
+
+  // Restart loop when phase changes so idle/mirror rendering changes
+  useEffect(() => {
+    cancelAnimationFrame(rafRef.current);
+    if (phase === 'idle' || phase === 'mirror' || phase === 'autocapture') {
+      startMirrorLoop();
     }
-    setCountdown(5);
+    return () => cancelAnimationFrame(rafRef.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Detection loop (every 150ms) — face count + smile stability check
+  // ─────────────────────────────────────────────────────────────────────────
+  const startDetectionLoop = useCallback(() => {
+    if (detectionTimer.current) clearInterval(detectionTimer.current);
+
+    detectionTimer.current = setInterval(async () => {
+      const video = videoRef.current;
+      const fa    = faceApiRef.current;
+      if (!video || video.paused || video.readyState < 2) return;
+
+      let count = 0;
+      let smileScore = 0;
+
+      if (fa) {
+        try {
+          const opts = new fa.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.40 });
+          const dets = await fa.detectAllFaces(video, opts).withFaceLandmarks(true);
+          count = dets.length;
+
+          if (count === 1) {
+            // Smile detection via mouth openness (landmarks 48–67)
+            const lm = dets[0].landmarks.positions;
+            const mouthTop    = lm[62]?.y ?? 0; // upper lip bottom
+            const mouthBottom = lm[66]?.y ?? 0; // lower lip top
+            const mouthLeft   = lm[48]?.x ?? 0;
+            const mouthRight  = lm[54]?.x ?? 0;
+            const opening   = Math.abs(mouthBottom - mouthTop);
+            const width     = Math.abs(mouthRight - mouthLeft);
+            const ratio     = width > 0 ? opening / width : 0;
+            // smile: wide & slightly open mouth
+            const cornerLeft  = lm[48];
+            const cornerRight = lm[54];
+            const cornerUp    = lm[51];
+            const upY = cornerUp?.y ?? 0;
+            const leftY  = cornerLeft?.y  ?? 0;
+            const rightY = cornerRight?.y ?? 0;
+            const cornerLift = ((leftY + rightY) / 2) - upY;
+            smileScore = Math.min(1, Math.max(0, (cornerLift / 15) * 0.6 + ratio * 0.4));
+          }
+        } catch (_) { /* ignore */ }
+      }
+
+      setFaceCount(count);
+
+      // Phase transitions
+      setPhase(prev => {
+        if (count === 0 && (prev === 'mirror' || prev === 'autocapture')) return 'idle';
+        if (count === 1 && prev === 'idle') return 'mirror';
+        return prev;
+      });
+
+      // Smile auto-capture accumulation
+      if (count === 1 && smileScore > 0.45) {
+        smileTimer.current += 150;
+        setSmilePct(Math.min(100, (smileTimer.current / 3000) * 100));
+        if (smileTimer.current >= 3000) {
+          smileTimer.current = 0;
+          setSmilePct(0);
+          triggerAutoCapture();
+        }
+      } else {
+        smileTimer.current = Math.max(0, smileTimer.current - 100);
+        setSmilePct(Math.max(0, (smileTimer.current / 3000) * 100));
+      }
+    }, 150);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const captureFrame = useCallback(async () => {
+  // ─────────────────────────────────────────────────────────────────────────
+  // FPS meter
+  // ─────────────────────────────────────────────────────────────────────────
+  const startFpsMeter = useCallback(() => {
+    if (fpsTimer.current) clearInterval(fpsTimer.current);
+    fpsTimer.current = setInterval(() => {
+      setFps(fpsCountRef.current);
+      fpsCountRef.current = 0;
+    }, 1000);
+  }, []);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Auto capture: grab HQ frame → upload → backend HQ generation
+  // Mirror continues running uninterrupted
+  // ─────────────────────────────────────────────────────────────────────────
+  const triggerAutoCapture = useCallback(async () => {
     const video = videoRef.current;
     if (!video || !streamRef.current) return;
 
-    setPhase('capturing');
-    setFlashActive(true);
-    playShutterSound();
-    setTimeout(() => setFlashActive(false), 300);
-
-    await new Promise((r) => setTimeout(r, 150));
-
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    // Draw mirrored (matches what user saw in preview)
-    ctx.save();
-    ctx.translate(canvas.width, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    ctx.restore();
-
-    setPhase('uploading');
-    releaseCamera();
+    setPhase('autocapture');
+    setFlash(true);
+    playShutter();
+    setTimeout(() => setFlash(false), 350);
 
     try {
-      const blob = await new Promise<Blob | null>((r) =>
-        canvas.toBlob(r, 'image/jpeg', 0.95)
-      );
-      if (!blob) throw new Error('Canvas encode failed');
-      const file = new File([blob], 'capture.jpg', { type: 'image/jpeg' });
+      const w = video.videoWidth  || 1280;
+      const h = video.videoHeight || 720;
+      const cap = document.createElement('canvas');
+      cap.width = w; cap.height = h;
+      const cc = cap.getContext('2d')!;
+      cc.save(); cc.translate(w, 0); cc.scale(-1, 1);
+      cc.drawImage(video, 0, 0, w, h);
+      cc.restore();
+
+      const blob: Blob | null = await new Promise(r => cap.toBlob(r, 'image/jpeg', 0.95));
+      if (!blob) return;
+
+      const file = new File([blob], 'mirror_capture.jpg', { type: 'image/jpeg' });
       const photo = await uploadManual(file);
+      // Send to backend HQ processing without blocking mirror
       onCaptured(photo.id, photo.original_url);
     } catch (err: any) {
-      alert('Capture failed: ' + err.message);
-      await startCamera();
+      console.error('Auto-capture failed:', err.message);
+    } finally {
+      setPhase('mirror');
     }
-  }, [releaseCamera, uploadManual, onCaptured, startCamera]);
+  }, [uploadManual, onCaptured]);
 
-  const startCountdown = useCallback(
-    (seconds: number) => {
-      setCountdown(seconds);
-      setPhase('detected');
+  // ─────────────────────────────────────────────────────────────────────────
+  // Cleanup
+  // ─────────────────────────────────────────────────────────────────────────
+  const stopAll = useCallback(() => {
+    cancelAnimationFrame(rafRef.current);
+    if (detectionTimer.current) clearInterval(detectionTimer.current);
+    if (fpsTimer.current) clearInterval(fpsTimer.current);
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+  }, []);
 
-      const tick = (remaining: number) => {
-        if (remaining <= 0) {
-          captureFrame();
-          return;
-        }
-        setCountdown(remaining);
-        countdownTimerRef.current = setTimeout(() => tick(remaining - 1), 1000);
-      };
-
-      if (countdownTimerRef.current) clearTimeout(countdownTimerRef.current);
-      countdownTimerRef.current = setTimeout(() => tick(seconds - 1), 1000);
-    },
-    [captureFrame]
-  );
-
-  // ── Detection loop ────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (phase !== 'waiting' && phase !== 'detected' && phase !== 'hold_still') return;
-    
-    const video = videoRef.current;
-    const overlay = overlayCanvasRef.current;
-    if (!video) return;
-
-    let running = true;
-    let consecutiveNoFace = 0;
-    let consecutiveFace = 0;
-    const FACE_CONFIRM_FRAMES = 3;   // frames needed to confirm face
-    const FACE_LOST_FRAMES = 8;      // frames without face before reset
-    const MOVE_THRESHOLD = 0.12;     // relative movement to trigger "hold still"
-
-    const getCtx = () => {
-      if (!overlay) return null;
-      const rect = video.getBoundingClientRect();
-      if (rect.width === 0) return null;
-      overlay.width = rect.width;
-      overlay.height = rect.height;
-      return overlay.getContext('2d');
-    };
-
-    const detectLoop = async () => {
-      if (!running || !video || video.paused || video.readyState < 2) {
-        if (running) animFrameRef.current = requestAnimationFrame(detectLoop);
-        return;
-      }
-
-      const oCtx = getCtx();
-      if (oCtx) oCtx.clearRect(0, 0, overlay!.width, overlay!.height);
-
-      const fa = (window as any).faceapi;
-      const faceDetected = fa && modelsReady;
-
-      let box: FaceBox | null = null;
-
-      if (faceDetected) {
-        try {
-          const opts = new fa.TinyFaceDetectorOptions({
-            inputSize: 224,
-            scoreThreshold: 0.45,
-          });
-          const det = await fa.detectSingleFace(video, opts);
-
-          if (det) {
-            const b = det.box;
-            box = { x: b.x, y: b.y, w: b.width, h: b.height };
-          }
-        } catch {
-          // ignore detection errors
-        }
-      } else {
-        // Fallback: assume person present if stream is active (no face-api)
-        box = {
-          x: video.videoWidth * 0.2,
-          y: video.videoHeight * 0.1,
-          w: video.videoWidth * 0.6,
-          h: video.videoHeight * 0.8,
-        };
-      }
-
-      if (box) {
-        consecutiveFace++;
-        consecutiveNoFace = 0;
-
-        // Draw guide frame on overlay canvas
-        if (oCtx && overlay) {
-          const scaleX = overlay.width / video.videoWidth;
-          const scaleY = overlay.height / video.videoHeight;
-          // Mirror the box
-          const fx = (video.videoWidth - box.x - box.w) * scaleX;
-          const fy = box.y * scaleY;
-          const fw = box.w * scaleX;
-          const fh = box.h * scaleY;
-          const cl = Math.min(fw, fh) * 0.18;
-
-          const isCountingDown = phase === 'detected';
-          oCtx.strokeStyle = isCountingDown ? '#00ff88' : '#bc34fa';
-          oCtx.lineWidth = 2.5;
-          oCtx.shadowColor = isCountingDown ? 'rgba(0,255,136,0.5)' : 'rgba(188,52,250,0.5)';
-          oCtx.shadowBlur = 10;
-
-          // Corner brackets
-          [ [fx, fy, cl, cl], [fx+fw-cl, fy, cl, cl], [fx, fy+fh-cl, cl, cl], [fx+fw-cl, fy+fh-cl, cl, cl] ]
-            .forEach(([bx, by, lx, ly], i) => {
-              oCtx.beginPath();
-              if (i === 0) { oCtx.moveTo(bx, by+ly); oCtx.lineTo(bx, by); oCtx.lineTo(bx+lx, by); }
-              if (i === 1) { oCtx.moveTo(bx, by); oCtx.lineTo(bx+lx, by); oCtx.lineTo(bx+lx, by+ly); }
-              if (i === 2) { oCtx.moveTo(bx, by); oCtx.lineTo(bx, by+ly); oCtx.lineTo(bx+lx, by+ly); }
-              if (i === 3) { oCtx.moveTo(bx, by); oCtx.lineTo(bx+lx, by); oCtx.lineTo(bx+lx, by+ly); }
-              oCtx.stroke();
-            });
-
-          oCtx.shadowBlur = 0;
-        }
-
-        // Check stability (movement detection)
-        const prev = lastFaceBoxRef.current;
-        let moved = false;
-        if (prev) {
-          const dx = Math.abs(box.x - prev.x) / video.videoWidth;
-          const dy = Math.abs(box.y - prev.y) / video.videoHeight;
-          const dw = Math.abs(box.w - prev.w) / video.videoWidth;
-          moved = dx + dy + dw > MOVE_THRESHOLD;
-        }
-        lastFaceBoxRef.current = box;
-
-        if (moved && phase === 'detected') {
-          // Person moved — pause countdown, show "Hold Still"
-          abortCountdown();
-          setPhase('hold_still');
-          setFaceDetected(true);
-          if (running) animFrameRef.current = requestAnimationFrame(detectLoop);
-          return;
-        }
-
-        if (moved && phase === 'hold_still') {
-          // Still moving
-          setFaceDetected(true);
-          if (running) animFrameRef.current = requestAnimationFrame(detectLoop);
-          return;
-        }
-
-        setFaceDetected(true);
-
-        // If enough consecutive frames with a stable face → start countdown
-        if (consecutiveFace >= FACE_CONFIRM_FRAMES) {
-          if (phase === 'waiting') {
-            startCountdown(5);
-          } else if (phase === 'hold_still') {
-            // Person stabilised again — restart countdown
-            startCountdown(5);
-          }
-        }
-      } else {
-        consecutiveFace = 0;
-        consecutiveNoFace++;
-        lastFaceBoxRef.current = null;
-
-        if (consecutiveNoFace >= FACE_LOST_FRAMES) {
-          setFaceDetected(false);
-          if (phase === 'detected' || phase === 'hold_still') {
-            abortCountdown();
-            setPhase('waiting');
-          }
-        }
-
-        // Still draw a subtle guide circle
-        if (oCtx && overlay) {
-          const cx = overlay.width / 2;
-          const cy = overlay.height / 2;
-          const r = Math.min(overlay.width, overlay.height) * 0.3;
-          oCtx.strokeStyle = 'rgba(255,255,255,0.12)';
-          oCtx.lineWidth = 1.5;
-          oCtx.setLineDash([8, 12]);
-          oCtx.beginPath();
-          oCtx.arc(cx, cy, r, 0, Math.PI * 2);
-          oCtx.stroke();
-          oCtx.setLineDash([]);
-        }
-      }
-
-      if (running) animFrameRef.current = requestAnimationFrame(detectLoop);
-    };
-
-    animFrameRef.current = requestAnimationFrame(detectLoop);
-    return () => {
-      running = false;
-      cancelAnimationFrame(animFrameRef.current);
-    };
-  }, [phase, modelsReady, startCountdown, abortCountdown]);
-
-  // ── File upload handlers ───────────────────────────────────────────────────
-
+  // ─────────────────────────────────────────────────────────────────────────
+  // Manual file upload
+  // ─────────────────────────────────────────────────────────────────────────
   const handleFileUpload = async (file: File) => {
-    releaseCamera();
-    setPhase('uploading');
     try {
       const photo = await uploadManual(file);
       onCaptured(photo.id, photo.original_url);
     } catch (err: any) {
       alert('Upload failed: ' + err.message);
-      await startCamera();
     }
   };
-
-  const onDragOver = (e: React.DragEvent) => e.preventDefault();
-  const onDrop = async (e: React.DragEvent) => {
-    e.preventDefault();
-    const f = e.dataTransfer.files?.[0];
-    if (f) await handleFileUpload(f);
-  };
-
-  // ── Countdown display ─────────────────────────────────────────────────────
-
-  const countdownLabel = useMemo(() => {
-    if (countdown <= 0) return '📸';
-    return String(countdown);
-  }, [countdown]);
-
-  // ── Camera active? ────────────────────────────────────────────────────────
-  const cameraLive = ['waiting', 'detected', 'hold_still'].includes(phase);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Render
   // ─────────────────────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col lg:flex-row gap-6 w-full">
+    <div className="relative w-full rounded-2xl overflow-hidden bg-[#06060c] border border-white/5 shadow-2xl"
+         style={{ aspectRatio: '16/9', minHeight: 320 }}>
 
-      {/* ── Live Viewport ─────────────────────────────────────────────────── */}
-      <div
-        onDragOver={onDragOver}
-        onDrop={onDrop}
-        className="relative flex-1 aspect-[4/3] rounded-2xl bg-cyber-darker border border-white/5 overflow-hidden shadow-inner"
-      >
+      {/* ── Always-on video (hidden) — source for inference ── */}
+      <video
+        ref={videoRef}
+        autoPlay playsInline muted
+        className="absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none"
+      />
 
-        {/* Video element always rendered — controlled by src */}
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          className="absolute inset-0 w-full h-full object-cover scale-x-[-1]"
-          style={{ display: cameraLive ? 'block' : 'none' }}
-        />
+      {/* ── Mirror canvas — the actual display ── */}
+      <canvas
+        ref={mirrorCanvasRef}
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{ display: (phase === 'idle' || phase === 'mirror' || phase === 'autocapture') ? 'block' : 'none' }}
+      />
 
-        {/* Overlay canvas */}
-        <canvas
-          ref={overlayCanvasRef}
-          className="absolute inset-0 z-10 pointer-events-none scale-x-[-1]"
-          style={{ display: cameraLive ? 'block' : 'none' }}
-        />
-        <canvas ref={hiddenCanvasRef} className="hidden" />
-
-        {/* ── Phase overlays ────────────────────────────────────────────── */}
-        <AnimatePresence mode="wait">
-
-          {/* Loading */}
-          {phase === 'loading' && (
-            <motion.div
-              key="loading"
-              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              className="absolute inset-0 flex flex-col items-center justify-center bg-cyber-darker z-20"
-            >
-              <RefreshCw className="w-10 h-10 text-cyber-neonBlue animate-spin mb-3" />
-              <p className="font-orbitron text-xs text-cyber-neonBlue tracking-widest animate-pulse">
-                INITIALISING CAMERA...
-              </p>
-            </motion.div>
-          )}
-
-          {/* Permission / Error */}
-          {phase === 'error' && (
-            <motion.div
-              key="error"
-              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              className="absolute inset-0 flex flex-col items-center justify-center p-8 text-center bg-cyber-darker z-20"
-            >
-              <CameraOff className="w-14 h-14 text-red-500 mb-4" />
-              <h3 className="font-orbitron font-bold text-sm text-red-400 mb-2">CAMERA ERROR</h3>
-              <p className="text-gray-400 text-xs max-w-xs leading-relaxed mb-6">{cameraError}</p>
-
-              <div className="flex flex-col gap-3 w-full max-w-xs">
-                {devices.length > 0 && (
-                  <select
-                    value={selectedDeviceId}
-                    onChange={(e) => setSelectedDeviceId(e.target.value)}
-                    className="bg-cyber-dark border border-white/10 rounded-lg p-2.5 text-xs text-gray-300 outline-none font-orbitron"
-                  >
-                    {devices.map((d, i) => (
-                      <option key={d.deviceId} value={d.deviceId}>
-                        {d.label || `Camera ${i + 1}`}
-                      </option>
-                    ))}
-                  </select>
-                )}
-                <button
-                  onClick={() => startCamera()}
-                  className="font-orbitron text-xs font-bold border border-cyber-purple/60 px-6 py-3 rounded-lg bg-cyber-purple/10 hover:bg-cyber-purple/20 text-white flex items-center justify-center gap-2"
-                >
-                  <RefreshCw className="w-4 h-4" /> RETRY CAMERA
-                </button>
-                <div className="text-[10px] text-gray-600 flex items-center justify-center gap-1">
-                  <Upload className="w-3 h-3" />
-                  or{' '}
-                  <span
-                    onClick={() => fileInputRef.current?.click()}
-                    className="text-cyber-neonBlue underline cursor-pointer"
-                  >
-                    upload a photo
-                  </span>
-                </div>
+      {/* ── BOOT overlay ── */}
+      <AnimatePresence>
+        {phase === 'boot' && (
+          <motion.div
+            key="boot"
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 flex flex-col items-center justify-center bg-[#06060c] z-30 p-8"
+          >
+            {/* Animated Ghibli orb */}
+            <div className="relative mb-8">
+              <div className="w-24 h-24 rounded-full bg-gradient-to-br from-emerald-400/30 via-cyan-400/20 to-purple-500/30 blur-xl animate-pulse absolute inset-0" />
+              <div className="w-24 h-24 rounded-full border border-emerald-400/30 flex items-center justify-center relative">
+                <div className="absolute inset-0 rounded-full border-t-2 border-emerald-400/60 animate-spin" />
+                <Sparkles className="w-8 h-8 text-emerald-300" />
               </div>
-            </motion.div>
-          )}
+            </div>
+            <h2 className="font-orbitron font-bold text-sm text-white tracking-widest mb-2">
+              GHIBLI MIRROR
+            </h2>
+            <p className="text-emerald-400/80 text-xs font-mono tracking-wider mb-6 animate-pulse">
+              {bootMsg}
+            </p>
+            {/* Progress bar */}
+            <div className="w-48 h-1 bg-white/5 rounded-full overflow-hidden">
+              <motion.div
+                className="h-full bg-gradient-to-r from-emerald-400 to-cyan-400 rounded-full"
+                animate={{ width: `${bootPct}%` }}
+                transition={{ duration: 0.4 }}
+              />
+            </div>
+            <p className="text-white/20 text-[10px] font-mono mt-3">{bootPct}%</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
-          {/* Uploading */}
-          {phase === 'uploading' && (
-            <motion.div
-              key="uploading"
-              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              className="absolute inset-0 bg-cyber-darker/95 backdrop-blur-md flex flex-col items-center justify-center z-30"
+      {/* ── ERROR overlay ── */}
+      <AnimatePresence>
+        {phase === 'error' && (
+          <motion.div
+            key="error"
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 flex flex-col items-center justify-center bg-[#06060c] z-30 p-8 text-center"
+          >
+            <div className="w-14 h-14 rounded-full bg-red-500/10 border border-red-500/40 flex items-center justify-center mb-4">
+              <Camera className="w-7 h-7 text-red-400" />
+            </div>
+            <h3 className="font-orbitron text-sm text-red-400 tracking-widest mb-2">MIRROR OFFLINE</h3>
+            <p className="text-gray-400 text-xs max-w-xs leading-relaxed mb-6">{errorMsg}</p>
+            <button
+              onClick={boot}
+              className="font-orbitron text-xs tracking-widest border border-emerald-500/40 px-6 py-2.5 rounded-lg text-emerald-400 hover:bg-emerald-500/10 transition-colors"
             >
-              <RefreshCw className="w-10 h-10 text-cyber-neonBlue animate-spin mb-3" />
-              <p className="font-orbitron text-xs text-cyber-neonBlue tracking-widest animate-pulse">
-                UPLOADING CAPTURE...
-              </p>
-            </motion.div>
-          )}
-
-        </AnimatePresence>
-
-        {/* ── Countdown overlay ───────────────────────────────────────────── */}
-        <AnimatePresence>
-          {phase === 'detected' && (
-            <motion.div
-              key={`cd-${countdown}`}
-              initial={{ scale: 0.4, opacity: 0 }}
-              animate={{ scale: 1.1, opacity: 1 }}
-              exit={{ scale: 1.8, opacity: 0 }}
-              transition={{ duration: 0.55, ease: 'backOut' }}
-              className="absolute inset-0 flex flex-col items-center justify-center z-20 pointer-events-none"
-            >
-              <div
-                className="font-orbitron font-extrabold text-[96px] leading-none text-transparent bg-clip-text bg-gradient-to-tr from-cyber-purple via-pink-400 to-cyber-neonBlue"
-                style={{ filter: 'drop-shadow(0 0 24px rgba(188,52,250,0.7))' }}
+              RETRY
+            </button>
+            <div className="mt-4 text-[10px] text-gray-600">
+              or{' '}
+              <span
+                className="text-cyan-400 underline cursor-pointer"
+                onClick={() => fileInputRef.current?.click()}
               >
-                {countdownLabel}
+                upload a photo
+              </span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── IDLE overlay — painted Ghibli scene ── */}
+      <AnimatePresence>
+        {phase === 'idle' && (
+          <motion.div
+            key="idle"
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            transition={{ duration: 0.8 }}
+            className="absolute inset-0 z-20 pointer-events-none"
+          >
+            {/* Dreamy Ghibli gradient sky */}
+            <div
+              className="absolute inset-0"
+              style={{
+                background: 'linear-gradient(180deg, #1a1a3e 0%, #2d1b5e 30%, #4a2870 55%, #7c3d8a 75%, #b06090 90%, #d4806a 100%)',
+              }}
+            />
+            {/* Stars */}
+            {[...Array(40)].map((_, i) => (
+              <div
+                key={i}
+                className="absolute rounded-full bg-white animate-pulse"
+                style={{
+                  width: Math.random() * 2 + 1,
+                  height: Math.random() * 2 + 1,
+                  top: `${Math.random() * 60}%`,
+                  left: `${Math.random() * 100}%`,
+                  animationDelay: `${Math.random() * 3}s`,
+                  animationDuration: `${2 + Math.random() * 3}s`,
+                  opacity: Math.random() * 0.7 + 0.3,
+                }}
+              />
+            ))}
+            {/* Ghibli moon */}
+            <div
+              className="absolute rounded-full"
+              style={{
+                width: 70, height: 70,
+                top: '12%', right: '15%',
+                background: 'radial-gradient(circle at 35% 35%, #fff9e6, #f5d78e)',
+                boxShadow: '0 0 30px 10px rgba(245,215,142,0.25)',
+              }}
+            />
+            {/* Rolling hills */}
+            <svg className="absolute bottom-0 w-full" viewBox="0 0 800 200" preserveAspectRatio="none">
+              <path d="M0,180 C100,120 200,160 300,140 C400,120 500,170 600,145 C700,120 750,155 800,140 L800,200 L0,200 Z" fill="#2d5016" />
+              <path d="M0,195 C80,155 180,185 280,165 C380,145 480,185 580,168 C680,150 740,175 800,162 L800,200 L0,200 Z" fill="#1e3a0a" />
+            </svg>
+            {/* Floating totoro-spirit wisps */}
+            {[...Array(5)].map((_, i) => (
+              <motion.div
+                key={i}
+                className="absolute rounded-full bg-white/20 blur-sm"
+                style={{
+                  width: 12 + i * 4,
+                  height: 12 + i * 4,
+                  bottom: `${15 + i * 5}%`,
+                  left: `${10 + i * 18}%`,
+                }}
+                animate={{ y: [-8, 8, -8] }}
+                transition={{ duration: 3 + i * 0.5, repeat: Infinity, ease: 'easeInOut', delay: i * 0.4 }}
+              />
+            ))}
+            {/* Center message */}
+            <div className="absolute inset-0 flex flex-col items-center justify-center">
+              <motion.div
+                animate={{ y: [-4, 4, -4] }}
+                transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
+                className="text-center"
+              >
+                <p className="font-orbitron text-white/90 text-sm md:text-base tracking-widest mb-1 drop-shadow-lg">
+                  ✨ Step in front of the camera
+                </p>
+                <p className="text-white/40 text-xs font-sans tracking-wider">
+                  Your Ghibli portrait will appear instantly
+                </p>
+              </motion.div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── MULTI-PERSON warning ── */}
+      <AnimatePresence>
+        {faceCount > 1 && phase === 'mirror' && (
+          <motion.div
+            key="multiperson"
+            initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 z-25 flex items-center justify-center pointer-events-none"
+          >
+            <div className="bg-amber-500/20 border border-amber-400/50 rounded-2xl px-6 py-4 text-center backdrop-blur-sm">
+              <p className="font-orbitron text-amber-300 text-xs tracking-widest">
+                👥 Please stand one person at a time
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Camera flash ── */}
+      <AnimatePresence>
+        {flash && (
+          <motion.div
+            key="flash"
+            initial={{ opacity: 1 }} animate={{ opacity: 0 }}
+            transition={{ duration: 0.35 }}
+            className="absolute inset-0 bg-white z-50 pointer-events-none"
+          />
+        )}
+      </AnimatePresence>
+
+      {/* ── HUD overlays (only in mirror mode) ── */}
+      {(phase === 'mirror' || phase === 'autocapture') && (
+        <>
+          {/* Top-left: LIVE badge + FPS */}
+          <div className="absolute top-3 left-3 z-20 flex items-center gap-2">
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/60 border border-white/10 text-[10px] font-orbitron text-emerald-400 tracking-widest">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-ping" />
+              LIVE
+            </div>
+            <div className="px-2 py-1 rounded-full bg-black/60 border border-white/10 text-[10px] font-mono text-white/50">
+              {fps} FPS
+            </div>
+          </div>
+
+          {/* Top-right: Ghibli label */}
+          <div className="absolute top-3 right-3 z-20">
+            <div className="px-2.5 py-1 rounded-full bg-black/60 border border-emerald-500/30 text-[10px] font-orbitron text-emerald-400/80 tracking-widest flex items-center gap-1">
+              <Sparkles className="w-3 h-3" />
+              GHIBLI MIRROR
+            </div>
+          </div>
+
+          {/* Bottom: Smile capture ring */}
+          {smilePct > 5 && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1"
+            >
+              <div className="relative w-12 h-12">
+                <svg className="w-12 h-12 -rotate-90" viewBox="0 0 48 48">
+                  <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="3" />
+                  <circle
+                    cx="24" cy="24" r="20"
+                    fill="none"
+                    stroke="#10b981"
+                    strokeWidth="3"
+                    strokeLinecap="round"
+                    strokeDasharray={`${2 * Math.PI * 20}`}
+                    strokeDashoffset={`${2 * Math.PI * 20 * (1 - smilePct / 100)}`}
+                    style={{ transition: 'stroke-dashoffset 0.15s ease' }}
+                  />
+                </svg>
+                <div className="absolute inset-0 flex items-center justify-center text-sm">😊</div>
               </div>
-              <p className="mt-4 font-orbitron text-xs text-white/60 tracking-widest">
-                {countdown > 0 ? 'HOLD STILL...' : 'CAPTURING!'}
+              <p className="text-[9px] font-orbitron text-emerald-400/80 tracking-widest">
+                {smilePct < 100 ? 'HOLD SMILE...' : 'CAPTURING!'}
               </p>
             </motion.div>
           )}
-        </AnimatePresence>
+        </>
+      )}
 
-        {/* ── Hold Still warning ──────────────────────────────────────────── */}
-        <AnimatePresence>
-          {phase === 'hold_still' && (
-            <motion.div
-              key="hold-still"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              className="absolute bottom-16 inset-x-0 flex justify-center z-20 pointer-events-none"
-            >
-              <div className="flex items-center gap-2 bg-amber-500/20 border border-amber-400/50 rounded-full px-5 py-2">
-                <Wind className="w-4 h-4 text-amber-400 animate-pulse" />
-                <span className="font-orbitron text-xs font-bold text-amber-300 tracking-widest">
-                  HOLD STILL
-                </span>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* ── Waiting — no person ─────────────────────────────────────────── */}
-        <AnimatePresence>
-          {phase === 'waiting' && !faceDetected && (
-            <motion.div
-              key="waiting-hint"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="absolute bottom-6 inset-x-0 flex justify-center z-20 pointer-events-none"
-            >
-              <div className="flex items-center gap-2 bg-cyber-darker/70 border border-white/10 rounded-full px-5 py-2">
-                <User className="w-4 h-4 text-gray-400" />
-                <span className="font-orbitron text-[10px] text-gray-400 tracking-widest">
-                  STEP IN FRONT OF CAMERA
-                </span>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* ── Flash effect ───────────────────────────────────────────────── */}
-        <AnimatePresence>
-          {flashActive && (
-            <motion.div
-              key="flash"
-              initial={{ opacity: 1 }}
-              animate={{ opacity: 0 }}
-              transition={{ duration: 0.3 }}
-              className="absolute inset-0 bg-white z-40"
-            />
-          )}
-        </AnimatePresence>
-
-        {/* ── Top-left status badge ──────────────────────────────────────── */}
-        {cameraLive && (
-          <div className="absolute top-4 left-4 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full bg-cyber-darker/80 border border-white/10 text-[9px] font-orbitron tracking-widest text-cyber-neonBlue select-none">
-            <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-ping" />
-            LIVE
-          </div>
-        )}
-
-        {/* ── Top-right stop button ─────────────────────────────────────── */}
-        {cameraLive && (
-          <button
-            onClick={() => { releaseCamera(); setPhase('error'); setCameraError('Camera stopped. Click Retry to reconnect.'); }}
-            className="absolute top-4 right-4 z-20 p-2 rounded-full bg-cyber-darker/80 border border-white/10 hover:border-red-400 text-gray-400 hover:text-red-400 transition-colors"
-            title="Stop camera"
+      {/* ── Auto-capture badge ── */}
+      <AnimatePresence>
+        {phase === 'autocapture' && (
+          <motion.div
+            key="autocap"
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute bottom-16 inset-x-0 flex justify-center z-20"
           >
-            <CameraOff className="w-4 h-4" />
-          </button>
+            <div className="px-4 py-2 rounded-full bg-emerald-500/20 border border-emerald-400/50 font-orbitron text-[10px] text-emerald-300 tracking-widest flex items-center gap-2">
+              <Wifi className="w-3 h-3 animate-pulse" /> SAVING HIGH-QUALITY PORTRAIT...
+            </div>
+          </motion.div>
         )}
+      </AnimatePresence>
 
-        {/* ── Camera switcher ────────────────────────────────────────────── */}
-        {cameraLive && devices.length > 1 && (
-          <div className="absolute bottom-4 left-4 z-20">
-            <select
-              value={selectedDeviceId}
-              onChange={(e) => startCamera(e.target.value)}
-              className="bg-cyber-darker/90 border border-white/10 rounded-lg p-1.5 text-[10px] text-gray-300 outline-none font-orbitron"
-            >
-              {devices.map((d, i) => (
-                <option key={d.deviceId} value={d.deviceId}>
-                  {d.label || `Camera ${i + 1}`}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+      {/* ── Hidden upload input ── */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={e => {
+          const f = e.target.files?.[0];
+          if (f) handleFileUpload(f);
+        }}
+      />
 
-        {/* Scan line animation when counting down */}
-        {phase === 'detected' && (
-          <div className="absolute inset-0 z-[5] pointer-events-none overflow-hidden">
-            <div className="absolute w-full h-[2px] bg-cyber-neonBlue/30 animate-scanline" />
-          </div>
-        )}
-
-        {/* Hidden file input */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          className="hidden"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) handleFileUpload(f);
-          }}
-        />
-      </div>
-
-      {/* ── Info sidebar ──────────────────────────────────────────────────── */}
-      <div className="w-full lg:w-64 flex flex-col gap-5 p-6 rounded-2xl glass-panel-glow border-cyber-purple/20">
-        <div>
-          <h3 className="font-orbitron font-bold text-xs tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-white to-gray-400 border-b border-white/5 pb-3">
-            BOOTH STATUS
-          </h3>
-
-          <div className="flex flex-col gap-3 mt-4">
-            <StatusRow label="Camera" ok={cameraLive} />
-            <StatusRow label="Person Detected" ok={faceDetected} />
-            <StatusRow label="Models Ready" ok={modelsReady} />
-          </div>
-        </div>
-
-        {/* Phase description */}
-        <div className="text-[10px] font-mono text-gray-500 leading-relaxed bg-cyber-darker/50 rounded-lg p-3 border border-white/5">
-          {phase === 'loading' && 'Connecting to camera...'}
-          {phase === 'waiting' && 'Waiting for you to step into frame. Stand in front of the camera.'}
-          {phase === 'detected' && `Person detected! Capturing in ${countdown}s — hold your pose and smile!`}
-          {phase === 'hold_still' && 'Movement detected! Hold perfectly still to resume countdown.'}
-          {phase === 'capturing' && 'Capturing your portrait...'}
-          {phase === 'uploading' && 'Uploading to AI engine...'}
-          {phase === 'error' && cameraError}
-        </div>
-
-        {/* Upload fallback */}
-        <div className="mt-auto">
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="w-full font-orbitron text-[10px] tracking-widest border border-white/10 hover:border-cyber-neonBlue py-2.5 rounded-lg text-gray-500 hover:text-cyber-neonBlue flex items-center justify-center gap-2 transition-colors"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            UPLOAD PHOTO INSTEAD
-          </button>
-        </div>
-      </div>
+      {/* ── Upload fallback button (bottom-right) ── */}
+      {phase !== 'boot' && phase !== 'error' && (
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="absolute bottom-3 right-3 z-20 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-black/60 border border-white/10 text-[9px] font-orbitron text-gray-400 hover:text-white hover:border-white/30 transition-colors"
+        >
+          <Upload className="w-3 h-3" />
+          UPLOAD PHOTO
+        </button>
+      )}
     </div>
   );
 };
-
-// ── Status row helper ─────────────────────────────────────────────────────────
-const StatusRow: React.FC<{ label: string; ok: boolean }> = ({ label, ok }) => (
-  <div className="flex items-center justify-between text-xs">
-    <span className="text-gray-400 font-sans">{label}</span>
-    <span
-      className={`w-2 h-2 rounded-full ${ok ? 'bg-emerald-400 shadow-[0_0_6px_#10b981]' : 'bg-gray-700'}`}
-    />
-  </div>
-);
 
 export default CameraFeed;
